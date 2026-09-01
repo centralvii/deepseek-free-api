@@ -39,6 +39,7 @@ class MultiProviderCommandCompleter(Completer):
     """Динамическое автодополнение команд и моделей для всех провайдеров."""
 
     COMMANDS = {
+        "/login": "Войти через окно браузера и автоматически получить токен",
         "/provider": "Переключить активного провайдера (deepseek, qwen)",
         "/model": "Переключить модель LLM",
         "/token": "Установить Bearer токен (например, /token qwen <токен>)",
@@ -55,6 +56,10 @@ class MultiProviderCommandCompleter(Completer):
     }
 
     SUBCOMMANDS = {
+        "/login": {
+            "deepseek": "Открыть браузер и войти в DeepSeek",
+            "qwen": "Открыть браузер и войти в Qwen",
+        },
         "/provider": {
             "deepseek": "DeepSeek (V4 Pro, V4 Flash, R1 Reasoner, V3)",
             "qwen": "Qwen Alibaba (Qwen 3.7 Plus, 3.8, 3.8-Coder, 3-Max, 3-Plus)",
@@ -210,17 +215,18 @@ class MultiProviderCLI:
     def print_help(self):
         help_text = """
 [bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
-  [bold yellow]/provider <deepseek|qwen>[/bold yellow]    - Переключить активного провайдера
-  [bold yellow]/model <name>[/bold yellow]                 - Переключить модель (v4-pro, qwen3.7-plus, qwen-3.8-coder и др.)
-  [bold yellow]/token [provider] <token>[/bold yellow]     - Установить Bearer токен для провайдера
-  [bold yellow]/think [show|hide|off][/bold yellow]      - Режим мыслей: показывать, скрывать или выключить
-  [bold yellow]/search [on|off][/bold yellow]              - Включить/выключить поиск в интернете
-  [bold yellow]/new[/bold yellow]                          - Начать новый чат (сбросить контекст диалога)
-  [bold yellow]/sessions[/bold yellow]                     - Список предыдущих сохраненных диалогов
-  [bold yellow]/session <ID>[/bold yellow]                 - Переключиться на существующий диалог
-  [bold yellow]/status[/bold yellow]                       - Показать текущее состояние и статус токенов
-  [bold yellow]/clear[/bold yellow]                        - Очистить экран терминала
-  [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]               - Выйти из консоли
+  [bold yellow]/login [deepseek|qwen][/bold yellow]    - Автоматический вход через окно браузера (без ручного копирования)
+  [bold yellow]/provider <deepseek|qwen>[/bold yellow] - Переключить активного провайдера
+  [bold yellow]/model <name>[/bold yellow]              - Переключить модель (v4-pro, qwen3.7-plus, qwen-3.8-coder и др.)
+  [bold yellow]/token [provider] <token>[/bold yellow]  - Установить Bearer токен вручную
+  [bold yellow]/think [show|hide|off][/bold yellow]   - Режим мыслей: показывать, скрывать или выключить
+  [bold yellow]/search [on|off][/bold yellow]           - Включить/выключить поиск в интернете
+  [bold yellow]/new[/bold yellow]                       - Начать новый чат (сбросить контекст диалога)
+  [bold yellow]/sessions[/bold yellow]                  - Список предыдущих сохраненных диалогов
+  [bold yellow]/session <ID>[/bold yellow]              - Переключиться на существующий диалог
+  [bold yellow]/status[/bold yellow]                    - Показать текущее состояние и статус токенов
+  [bold yellow]/clear[/bold yellow]                     - Очистить экран терминала
+  [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]            - Выйти из консоли
         """
         console.print(Panel(help_text, title="Справка", border_style="cyan"))
 
@@ -244,8 +250,8 @@ class MultiProviderCLI:
 
         if not provider.is_authenticated():
             console.print(
-                f"[bold red]Ошибка:[/bold red] Укажите токен авторизации для {provider.display_name} с помощью команды:\n"
-                f"[bold yellow]/token {provider.provider_id} <ваш_токен>[/bold yellow]"
+                f"[bold red]Ошибка:[/bold red] Учетные данные для {provider.display_name} не настроены.\n"
+                f"Выполните автологин: [bold yellow]/login {provider.provider_id}[/bold yellow] или укажите токен: [bold yellow]/token {provider.provider_id} <токен>[/bold yellow]"
             )
             return
 
@@ -345,6 +351,19 @@ class MultiProviderCLI:
                     elif cmd == "/clear":
                         os.system("cls" if os.name == "nt" else "clear")
                         self.print_banner()
+                    elif cmd == "/login":
+                        target_p = arg.lower().strip() if arg else self.provider_id
+                        if target_p not in ["deepseek", "qwen"]:
+                            target_p = self.provider_id
+                        console.print(f"\n[bold cyan]🌐 Запуск браузера Chrome для авторизации в {target_p.upper()}...[/bold cyan]")
+                        console.print("[dim]Войдите в аккаунт в открывшемся окне браузера. Токен будет перехвачен и сохранен автоматически.[/dim]\n")
+                        from app.services.browser_auth import extract_token_via_browser
+                        tok = await extract_token_via_browser(provider=target_p, headless=False, timeout_seconds=120)
+                        if tok:
+                            console.print(f"\n[bold green]✓ Токен для {target_p} успешно перехвачен и сохранен в credentials.json![/bold green]\n")
+                        else:
+                            console.print(f"\n[bold red]✗ Не удалось извлечь токен (таймаут или окно было закрыто).[/bold red]\n")
+                        self.print_status()
                     elif cmd == "/provider":
                         if not arg:
                             console.print("[yellow]Использование:[/yellow] /provider <deepseek | qwen>")
