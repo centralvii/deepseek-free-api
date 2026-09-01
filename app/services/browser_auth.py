@@ -11,6 +11,46 @@ from app.core.credentials import credentials_manager
 logger = logging.getLogger(__name__)
 
 
+def clean_deepseek_token(val: Optional[str]) -> Optional[str]:
+    """Проверяет и очищает токен DeepSeek. Отсекает 'null', 'undefined' и пустые объекты."""
+    if not val or not isinstance(val, str):
+        return None
+    
+    t = val.strip()
+    if t in ["null", "undefined", "None", "", "{}", "[]"]:
+        return None
+        
+    # Если в localStorage лежит объект вида {"value": null, "__version": "0"}
+    if t.startswith("{"):
+        try:
+            data = json.loads(t)
+            v = data.get("value")
+            if not v or str(v).lower() in ["null", "undefined", "none", ""]:
+                return None
+            t = str(v).strip()
+        except Exception:
+            return None
+
+    if "value\":null" in t or "value\": null" in t:
+        return None
+
+    # Настоящий токен DeepSeek - это длинная строка (обычно JWT или токен сессии >= 30 символов)
+    if len(t) >= 30 and (t.startswith("ey") or "." in t or len(t) >= 40):
+        return t
+        
+    return None
+
+
+def clean_qwen_token(val: Optional[str]) -> Optional[str]:
+    """Проверяет и очищает сессионные Cookie/JWT для Qwen."""
+    if not val or not isinstance(val, str):
+        return None
+    t = val.strip()
+    if "token=eyJ" in t or (t.startswith("eyJ") and len(t) > 40):
+        return t
+    return None
+
+
 async def extract_token_via_browser(
     provider: str = "deepseek",
     headless: bool = False,
@@ -18,8 +58,7 @@ async def extract_token_via_browser(
 ) -> Optional[str]:
     """
     Открывает системный браузер Google Chrome (или Edge),
-    мгновенно отображает страницу авторизации и непрерывно перехватывает
-    токен авторизации в реальном времени.
+    ждет реального входа пользователя в аккаунт и перехватывает токен авторизации.
     """
     prov = provider.lower().strip()
     profile_dir = os.path.abspath(".browser_profile")
@@ -68,7 +107,7 @@ async def extract_token_via_browser(
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
 
-        # 1. Мгновенный перехват заголовков Authorization из сетевого потока
+        # 1. Перехват исходящих сетевых запросов
         async def on_request(request):
             nonlocal extracted_token
             req_url = request.url
@@ -76,50 +115,53 @@ async def extract_token_via_browser(
 
             if prov == "deepseek":
                 if auth_hdr and "Bearer " in auth_hdr and "chat.deepseek.com" in req_url:
-                    tok = auth_hdr.replace("Bearer ", "").strip()
-                    if tok and len(tok) > 20 and not extracted_token:
-                        extracted_token = tok
-                        logger.info("Токен DeepSeek перехвачен из сетевого запроса!")
+                    raw_tok = auth_hdr.replace("Bearer ", "").strip()
+                    valid_tok = clean_deepseek_token(raw_tok)
+                    if valid_tok and not extracted_token:
+                        extracted_token = valid_tok
+                        logger.info("Валидный токен DeepSeek перехвачен из сетевого запроса!")
 
             elif prov == "qwen":
                 if auth_hdr and "Bearer " in auth_hdr and "chat.qwen.ai" in req_url:
-                    tok = auth_hdr.replace("Bearer ", "").strip()
-                    if tok and len(tok) > 20 and not extracted_token:
-                        extracted_token = tok
-                        logger.info("Токен Qwen перехвачен из сетевого запроса!")
+                    raw_tok = auth_hdr.replace("Bearer ", "").strip()
+                    valid_tok = clean_qwen_token(raw_tok)
+                    if valid_tok and not extracted_token:
+                        extracted_token = valid_tok
+                        logger.info("Валидный токен Qwen перехвачен из сетевого запроса!")
 
         page.on("request", on_request)
 
-        # 2. Мгновенный переход без блокировки загрузки (wait_until='commit')
+        # 2. Мгновенный переход на страницу входа
         try:
             await page.goto(target_url, wait_until="commit", timeout=60000)
         except Exception as e:
             logger.warning(f"Навигация: {e}")
 
-        # 3. Цикл непрерывного мониторинга входа
+        # 3. Ожидание авторизации пользователя (до 5 минут)
         for sec in range(timeout_seconds):
             if extracted_token:
                 break
 
-            # Если пользователь вручную закрыл страницу
+            # Если пользователь закрыл вкладку/окно
             if page.is_closed():
                 break
 
             try:
                 if prov == "deepseek":
+                    # Проверяем userToken в localStorage
                     ls_val = await page.evaluate("""() => {
                         try {
                             const raw = localStorage.getItem('userToken');
                             if (!raw) return null;
-                            const p = JSON.parse(raw);
-                            return p.value || raw;
+                            return raw;
                         } catch(e) {
-                            return localStorage.getItem('userToken') || localStorage.getItem('token');
+                            return null;
                         }
                     }""")
-                    if ls_val and len(str(ls_val)) > 20:
-                        extracted_token = str(ls_val).strip()
-                        logger.info("Токен DeepSeek извлечен из localStorage!")
+                    valid_tok = clean_deepseek_token(ls_val)
+                    if valid_tok:
+                        extracted_token = valid_tok
+                        logger.info("Валидный токен DeepSeek извлечен из localStorage!")
                         break
 
                 elif prov == "qwen":
@@ -129,7 +171,7 @@ async def extract_token_via_browser(
                     for c in cookies:
                         if c.get("domain") and "qwen.ai" in c["domain"]:
                             cookie_parts.append(f"{c['name']}={c['value']}")
-                            if c["name"] == "token" and len(c["value"]) > 30:
+                            if c["name"] == "token" and len(c["value"]) > 30 and c["value"].startswith("eyJ"):
                                 found_jwt = c["value"]
 
                     if cookie_parts and found_jwt:
@@ -168,4 +210,4 @@ if __name__ == "__main__":
     if res:
         print(f"\n[УСПЕХ] Токен для {prov_arg} успешно получен и сохранен в credentials.json!")
     else:
-        print(f"\n[ОШИБКА] Не удалось получить токен.")
+        print(f"\n[ОШИБКА] Не удалось получить токен (пользователь не вошел в аккаунт или окно закрыто).")
