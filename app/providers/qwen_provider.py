@@ -169,7 +169,7 @@ class QwenProvider(BaseLLMProvider):
 
         headers = {
             "Accept": "application/json, text/event-stream",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Connection": "keep-alive",
             "Content-Type": "application/json",
@@ -310,6 +310,10 @@ class QwenProvider(BaseLLMProvider):
                 detail="Учетные данные Qwen не настроены. Укажите токен или Cookie через команду /token qwen <токен_или_куки>."
             )
 
+        from app.services.context_compressor import context_compressor, estimate_tokens
+        if request.prompt:
+            request.prompt = context_compressor.compress_raw_prompt(request.prompt)
+
         chat_id = await self.get_or_create_chat(request.chat_session_id)
         resolved_model = self._resolve_qwen_model(request.model)
         thinking_enabled = request.thinking_enabled if request.thinking_enabled is not None else True
@@ -318,16 +322,21 @@ class QwenProvider(BaseLLMProvider):
         headers = self._build_headers(token, chat_id, thinking_enabled)
         payload = self._build_payload(request.prompt, resolved_model, chat_id, thinking_enabled, search_enabled)
 
+        logger.info(f"Отправка запроса в Qwen API (chat_id: {chat_id}, модель: {resolved_model}, промпт: ~{estimate_tokens(request.prompt):,} токенов)")
+
+        # Отправляем начальный чанк с session_id
+        yield StreamChunk(type="session", text=chat_id, session_id=chat_id)
+
         url = f"{self.base_url}/api/v2/chat/completions?chat_id={chat_id}"
 
         try:
-            req = self.client.build_request("POST", url, json=payload, headers=headers, timeout=120.0)
+            req = self.client.build_request("POST", url, json=payload, headers=headers, timeout=180.0)
             resp = await self.client.send(req, stream=True)
 
             if resp.status_code != 200:
                 body = await resp.aread()
                 err_text = body.decode("utf-8", errors="replace")
-                logger.error(f"Qwen error ({resp.status_code}): {err_text}")
+                logger.error(f"Qwen HTTP {resp.status_code} error: {err_text}")
                 raise HTTPException(
                     status_code=resp.status_code,
                     detail=f"Qwen API error ({resp.status_code}): {err_text}"
@@ -335,19 +344,56 @@ class QwenProvider(BaseLLMProvider):
 
             last_thought_len = 0
             token_usage = None
+            received_chunks_count = 0
 
             async for line in resp.aiter_lines():
                 line = line.strip()
-                if not line or not line.startswith("data:"):
+                if not line:
+                    continue
+
+                # 1. Проверка на ошибки Alibaba WAF / Капчу (ответ не в формате SSE)
+                if line.startswith("{"):
+                    try:
+                        err_json = json.loads(line)
+                        ret_list = err_json.get("ret", [])
+                        ret_str = str(ret_list)
+                        if "FAIL_SYS_USER_VALIDATE" in ret_str or "RGV587_ERROR" in ret_str or "punish" in str(err_json):
+                            logger.error(f"❌ Alibaba Cloud WAF заблокировал запрос (капча / rate limit): {err_json}")
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Alibaba WAF (Капча/Блокировка): Сессия Qwen требует подтверждения в браузере. Выполните команду /login qwen в терминале."
+                            )
+                        if "error" in err_json or "code" in err_json:
+                            err_msg = err_json.get("message") or err_json.get("error") or err_json.get("code")
+                            logger.error(f"❌ Qwen API ошибка в ответе: {err_json}")
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Qwen API error: {err_msg}"
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
+                if not line.startswith("data:"):
                     continue
 
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
+                    logger.debug("Qwen stream [DONE] получен.")
                     yield StreamChunk(type="status", text="FINISHED", session_id=chat_id, token_usage=token_usage)
                     break
 
                 try:
                     data = json.loads(data_str)
+
+                    # Проверка ошибок внутри SSE
+                    if "error" in data or ("code" in data and data["code"] not in [200, "200", 0, "0"]):
+                        err_msg = data.get("message") or data.get("error") or data.get("code")
+                        logger.error(f"❌ Ошибка в SSE потоке Qwen: {data}")
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Qwen SSE error: {err_msg}"
+                        )
+
                     if "usage" in data and isinstance(data["usage"], dict):
                         token_usage = data["usage"].get("total_tokens") or data["usage"].get("output_tokens")
 
@@ -367,32 +413,44 @@ class QwenProvider(BaseLLMProvider):
                             if len(full_thought) > last_thought_len:
                                 new_thought_piece = full_thought[last_thought_len:]
                                 last_thought_len = len(full_thought)
+                                received_chunks_count += 1
                                 yield StreamChunk(type="thinking", text=new_thought_piece, session_id=chat_id)
 
                         elif delta.get("reasoning_content"):
+                            received_chunks_count += 1
                             yield StreamChunk(type="thinking", text=delta["reasoning_content"], session_id=chat_id)
                         elif delta.get("thought"):
+                            received_chunks_count += 1
                             yield StreamChunk(type="thinking", text=delta["thought"], session_id=chat_id)
 
                         # 2. Ответ
                         content = delta.get("content")
                         if content:
+                            received_chunks_count += 1
                             yield StreamChunk(type="content", text=content, session_id=chat_id, token_usage=token_usage)
 
                     elif "response" in data and isinstance(data["response"], dict):
                         resp_obj = data["response"]
                         if resp_obj.get("thinking"):
+                            received_chunks_count += 1
                             yield StreamChunk(type="thinking", text=resp_obj["thinking"], session_id=chat_id)
                         if resp_obj.get("content"):
+                            received_chunks_count += 1
                             yield StreamChunk(type="content", text=resp_obj["content"], session_id=chat_id, token_usage=token_usage)
 
                     elif "output" in data and isinstance(data["output"], dict):
                         out_text = data["output"].get("text", "")
                         if out_text:
+                            received_chunks_count += 1
                             yield StreamChunk(type="content", text=out_text, session_id=chat_id, token_usage=token_usage)
 
-                except Exception:
-                    pass
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.debug(f"Исключение при парсинге чанка Qwen: {e}")
+
+            if received_chunks_count == 0:
+                logger.warning(f"⚠️ Qwen API вернул 0 токенов (chat_id: {chat_id}). Возможно сессия устарела или сработала защита.")
 
         except HTTPException:
             raise
