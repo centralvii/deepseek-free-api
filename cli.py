@@ -300,7 +300,7 @@ class MultiProviderCLI:
 
             print("\n", flush=True)
 
-            sid = session_manager.get_current_session_id() or ""
+            sid = session_manager.get_current_session_id() or getattr(provider, "_current_chat_id", None) or ""
             info_str = f"[dim]Провайдер: {provider.display_name} | Модель: {self.model} | Использовано токенов: {tokens_count or 'N/A'}[/dim]\n"
             console.print(info_str)
 
@@ -357,6 +357,12 @@ class MultiProviderCLI:
                             self.print_status()
                     elif cmd == "/new":
                         session_manager.reset_context()
+                        try:
+                            cur_p = provider_registry.get_provider(self.provider_id)
+                            if hasattr(cur_p, "reset_session"):
+                                cur_p.reset_session()
+                        except Exception:
+                            pass
                         console.print("[green]✓ Начат новый диалог. Контекст сброшен.[/green]")
                         self.print_status()
                     elif cmd == "/think":
