@@ -13,8 +13,8 @@ from prompt_toolkit.styles import Style
 
 from app.core.config import settings
 from app.core.credentials import credentials_manager
+from app.providers.registry import provider_registry
 from app.schemas.chat import DeepSeekChatRequest
-from app.services.deepseek_client import DeepSeekClient
 from app.services.session_manager import session_manager
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -35,14 +35,15 @@ prompt_style = Style.from_dict({
 })
 
 
-class DeepSeekCommandCompleter(Completer):
+class MultiProviderCommandCompleter(Completer):
     COMMANDS = {
+        "/provider": "Переключить активного провайдера (deepseek, qwen, glm)",
+        "/model": "Переключить модель LLM",
+        "/token": "Установить Bearer токен (например, /token qwen <токен>)",
+        "/think": "Режим рассуждений/мыслей (show / hide / off)",
+        "/search": "Веб-поиск в реальном времени (on / off)",
         "/new": "Начать новый диалог (сбросить контекст)",
-        "/think": "Режим рассуждений R1 (show / hide / off)",
-        "/search": "Поиск в интернете (on / off)",
-        "/model": "Переключить модель (chat, reasoner, search)",
-        "/token": "Установить Bearer токен авторизации",
-        "/status": "Показать статус, модель и ID сессии",
+        "/status": "Показать статус провайдеров, модель и ID сессии",
         "/clear": "Очистить экран терминала",
         "/help": "Показать список доступных команд",
         "/exit": "Выйти из консоли",
@@ -50,30 +51,44 @@ class DeepSeekCommandCompleter(Completer):
     }
 
     SUBCOMMANDS = {
+        "/provider": {
+            "deepseek": "DeepSeek (V4 Pro, V4 Flash, R1 Reasoner, V3)",
+            "qwen": "Qwen Alibaba (Qwen 3.8, 3.8-Coder, 3-Max, 3-Plus)",
+            "glm": "GLM Zhipu AI (GLM 5.3, 5-Pro, 5-Coder, 5-Flash)",
+        },
         "/think": {
-            "show": "Включить R1 и показывать блок мыслей",
-            "hide": "Включить R1, но скрыть мысли (только ответ)",
-            "on": "Включить R1 (показывать мысли)",
-            "off": "Выключить рассуждения (быстрый чат V3)",
+            "show": "Включить рассуждения и показывать блок мыслей",
+            "hide": "Включить рассуждения, но скрыть мысли (только ответ)",
+            "on": "Включить рассуждения (показывать мысли)",
+            "off": "Выключить рассуждения",
         },
         "/search": {
             "on": "Включить поиск в интернете",
             "off": "Выключить поиск",
         },
         "/model": {
-            "deepseek-v4-pro": "DeepSeek V4 Pro (1.6T MoE, рассуждения, код)",
-            "deepseek-v4-flash": "DeepSeek V4 Flash (284B MoE, быстрая)",
-            "deepseek-v4-flash-vision-exp": "DeepSeek V4 Vision (мультимодальная)",
-            "deepseek-reasoner": "DeepSeek R1 (рассуждения)",
-            "deepseek-chat": "DeepSeek V3 (быстрый чат)",
-            "deepseek-search": "DeepSeek V3 (веб-поиск)",
-            "v4-pro": "V4 Pro",
-            "v4-flash": "V4 Flash",
-            "v4-vision": "V4 Vision",
-            "reasoner": "R1 Reasoner",
-            "chat": "V3 Chat",
-            "search": "V3 Search",
+            "deepseek-v4-pro": "[DeepSeek] 1.6T MoE (49B act) рассуждения и сложный код",
+            "deepseek-v4-flash": "[DeepSeek] 284B MoE сверхбыстрый чат",
+            "deepseek-v4-flash-vision-exp": "[DeepSeek] Мультимодальная модель",
+            "deepseek-reasoner": "[DeepSeek] R1 модель пошаговых рассуждений",
+            "deepseek-chat": "[DeepSeek] V3 универсальный чат",
+            "deepseek-search": "[DeepSeek] V3 с веб-поиском",
+            "qwen-3.8": "[Qwen] Флагман 3-го поколения с рассуждениями",
+            "qwen-3.8-coder": "[Qwen] Специализированная модель для сложного кодинга",
+            "qwen-3-max": "[Qwen] Максимальная интеллектуальная мощность",
+            "qwen-3-plus": "[Qwen] Быстрый универсальный ассистент",
+            "qwen-3-flash": "[Qwen] Zero-Latency мгновенные ответы",
+            "glm-5.3": "[GLM] Новейший флагман 5.3 с глубоким пониманием",
+            "glm-5-pro": "[GLM] Профессиональная модель рассуждений",
+            "glm-5-coder": "[GLM] Специализированная модель для разработки и аудита",
+            "glm-5-flash": "[GLM] Сверхбыстрая легковесная модель",
+            "glm-4-plus": "[GLM] Проверенная модель GLM-4 Plus",
         },
+        "/token": {
+            "deepseek": "Установить токен для DeepSeek",
+            "qwen": "Установить токен для Qwen",
+            "glm": "Установить токен для GLM",
+        }
     }
 
     def get_completions(self, document, complete_event):
@@ -100,13 +115,13 @@ class DeepSeekCommandCompleter(Completer):
                         yield Completion(sub_cmd, start_position=-len(sub_prefix), display_meta=desc)
 
 
-class DeepSeekCLI:
+class MultiProviderCLI:
     def __init__(self):
-        self.model = "deepseek-chat"
+        self.provider_id = "deepseek"
+        self.model = "deepseek-v4-pro"
         self.thinking_mode = "show"
         self.search_enabled = False
         self.http_client: Optional[httpx.AsyncClient] = None
-        self.client: Optional[DeepSeekClient] = None
         self.session: Optional[PromptSession] = None
 
     async def init(self):
@@ -115,11 +130,11 @@ class DeepSeekCLI:
             follow_redirects=True,
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         )
-        self.client = DeepSeekClient(self.http_client)
+        provider_registry.init_providers(self.http_client)
         self.session = PromptSession(
             history=InMemoryHistory(),
             auto_suggest=AutoSuggestFromHistory(),
-            completer=DeepSeekCommandCompleter(),
+            completer=MultiProviderCommandCompleter(),
             style=prompt_style,
         )
 
@@ -132,23 +147,24 @@ class DeepSeekCLI:
         return self.thinking_mode in ["show", "hide"]
 
     def get_bottom_toolbar(self):
+        prov_name = provider_registry.get_provider(self.provider_id).display_name
         if self.thinking_mode == "show":
-            think_str = "🧠 R1: ПОКАЗАТЬ МЫСЛИ"
+            think_str = "🧠 Мысли: ПОКАЗАТЬ"
         elif self.thinking_mode == "hide":
-            think_str = "🧠 R1: СКРЫТЬ МЫСЛИ"
+            think_str = "🧠 Мысли: СКРЫТЬ"
         else:
-            think_str = "🧠 R1: ВЫКЛ"
+            think_str = "🧠 Мысли: ВЫКЛ"
 
         search_str = "🌐 Поиск: ВКЛ" if self.search_enabled else "🌐 Поиск: ВЫКЛ"
         sid = session_manager.get_current_session_id()
-        session_short = (sid[:8] + "...") if sid else "новая сессия"
-        return f" [Модель: {self.model}] | [{think_str}] | [{search_str}] | [Сессия: {session_short}] "
+        session_short = (sid[:8] + "...") if sid else "новая"
+        return f" [{prov_name}] | [Модель: {self.model}] | [{think_str}] | [{search_str}] | [Сессия: {session_short}] "
 
     def print_banner(self):
         banner = """
 [bold cyan]╔══════════════════════════════════════════════════════════════════╗
-║              DeepSeek Reverse-Engineered Web CLI                 ║
-║       Прямой доступ к chat.deepseek.com (без API ключей)         ║
+║             Multi-LLM Reverse-Engineered Web CLI                 ║
+║       DeepSeek V4/R1  •  Qwen 3.8/Coder  •  GLM 5.3/Pro          ║
 ╚══════════════════════════════════════════════════════════════════╝[/bold cyan]
         """
         console.print(banner)
@@ -156,7 +172,9 @@ class DeepSeekCLI:
         console.print("[dim]Начните ввод сообщения или введите [bold]/[/bold] для вызова меню команд.[/dim]\n")
 
     def print_status(self):
-        auth_status = "[green]✓ Авторизован[/green]" if credentials_manager.is_authenticated() else "[bold red]✗ Нет токена[/bold red]"
+        provider = provider_registry.get_provider(self.provider_id)
+        is_auth = provider.is_authenticated()
+        auth_status = f"[green]✓ Авторизован ({provider.display_name})[/green]" if is_auth else f"[bold red]✗ Нет токена ({provider.display_name})[/bold red]"
         session_id = session_manager.get_current_session_id() or "[dim]не создана (будет создана при первом запросе)[/dim]"
 
         if self.thinking_mode == "show":
@@ -166,33 +184,65 @@ class DeepSeekCLI:
         else:
             think_label = "[dim]ВЫКЛ[/dim]"
 
+        tokens_info = []
+        for p in provider_registry.list_providers():
+            mark = "[green]✓[/green]" if p["authenticated"] else "[red]✗[/red]"
+            active_mark = " [bold cyan](активен)[/bold cyan]" if p["id"] == self.provider_id else ""
+            tokens_info.append(f"{mark} {p['name']}{active_mark}")
+
         status_table = (
-            f"  • [bold]Статус auth:[/bold] {auth_status}\n"
-            f"  • [bold]Модель:[/bold] [yellow]{self.model}[/yellow]\n"
-            f"  • [bold]Deep Thinking (R1):[/bold] {think_label}\n"
+            f"  • [bold]Провайдеры:[/bold] {' | '.join(tokens_info)}\n"
+            f"  • [bold]Текущий статус:[/bold] {auth_status}\n"
+            f"  • [bold]Выбранная модель:[/bold] [yellow]{self.model}[/yellow]\n"
+            f"  • [bold]Thinking / Рассуждения:[/bold] {think_label}\n"
             f"  • [bold]Web Search:[/bold] {'[green]ВКЛ[/green]' if self.search_enabled else '[dim]ВЫКЛ[/dim]'}\n"
             f"  • [bold]ID Сессии:[/bold] {session_id}"
         )
-        console.print(Panel(status_table, title="[bold]Текущее состояние[/bold]", border_style="blue"))
+        console.print(Panel(status_table, title="[bold]Панель состояния[/bold]", border_style="blue"))
 
     def print_help(self):
         help_text = """
 [bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
-  [bold yellow]/help[/bold yellow]                    - Показать эту справку
-  [bold yellow]/status[/bold yellow]                  - Показать текущее состояние, модель и сессию
-  [bold yellow]/clear[/bold yellow]                   - Очистить экран терминала
-  [bold yellow]/token <token>[/bold yellow]           - Установить/обновить Bearer токен авторизации
-  [bold yellow]/new[/bold yellow]                     - Начать новый чат (сбросить контекст диалога)
-  [bold yellow]/model <name>[/bold yellow]            - Переключить модель ([dim]chat, reasoner, search, pro, flash, vision[/dim])
-  [bold yellow]/think [show|hide|off][/bold yellow] - Режим мыслей R1: показывать, скрывать или выключить
-  [bold yellow]/search [on|off][/bold yellow]         - Включить/выключить поиск в интернете
-  [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]          - Выйти из консоли
+  [bold yellow]/provider <deepseek|qwen|glm>[/bold yellow] - Переключить активного провайдера
+  [bold yellow]/model <name>[/bold yellow]                 - Переключить модель (v4-pro, qwen-3.8-coder, glm-5.3 и др.)
+  [bold yellow]/token [provider] <token>[/bold yellow]     - Установить Bearer токен для провайдера
+  [bold yellow]/think [show|hide|off][/bold yellow]      - Режим мыслей: показывать, скрывать или выключить
+  [bold yellow]/search [on|off][/bold yellow]              - Включить/выключить поиск в интернете
+  [bold yellow]/new[/bold yellow]                          - Начать новый чат (сбросить контекст диалога)
+  [bold yellow]/status[/bold yellow]                       - Показать текущее состояние и статус токенов
+  [bold yellow]/clear[/bold yellow]                        - Очистить экран терминала
+  [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]               - Выйти из консоли
         """
         console.print(Panel(help_text, title="Справка", border_style="cyan"))
 
+    def set_provider_and_default_model(self, pid: str):
+        pid = pid.lower().strip()
+        if pid == "qwen":
+            self.provider_id = "qwen"
+            self.model = "qwen-3.8-coder"
+            provider_registry.set_default_provider("qwen")
+            console.print("[green]✓ Переключено на Qwen (по умолчанию модель qwen-3.8-coder)[/green]")
+        elif pid == "glm":
+            self.provider_id = "glm"
+            self.model = "glm-5.3"
+            provider_registry.set_default_provider("glm")
+            console.print("[green]✓ Переключено на GLM (по умолчанию модель glm-5.3)[/green]")
+        elif pid == "deepseek":
+            self.provider_id = "deepseek"
+            self.model = "deepseek-v4-pro"
+            provider_registry.set_default_provider("deepseek")
+            console.print("[green]✓ Переключено на DeepSeek (по умолчанию модель deepseek-v4-pro)[/green]")
+        else:
+            console.print(f"[red]Неизвестный провайдер:[/red] {pid}. Доступные: deepseek, qwen, glm")
+
     async def handle_chat(self, user_input: str):
-        if not credentials_manager.is_authenticated():
-            console.print("[bold red]Ошибка:[/bold red] Укажите токен авторизации с помощью команды [bold]/token <ваш_токен>[/bold]")
+        provider = provider_registry.resolve_provider_for_model(self.model)
+
+        if not provider.is_authenticated():
+            console.print(
+                f"[bold red]Ошибка:[/bold red] Укажите токен авторизации для {provider.display_name} с помощью команды:\n"
+                f"[bold yellow]/token {provider.provider_id} <ваш_токен>[/bold yellow]"
+            )
             return
 
         req = DeepSeekChatRequest(
@@ -208,21 +258,21 @@ class DeepSeekCLI:
         tokens_count = 0
 
         try:
-            async for chunk in self.client.stream_chat(req):
+            async for chunk in provider.stream_chat(req):
                 if chunk.token_usage:
                     tokens_count = chunk.token_usage
 
                 if chunk.type == "thinking":
                     if self.thinking_mode == "show":
                         if not in_thinking:
-                            console.print("\n[dim]╭─── 🧠 Рассуждения DeepSeek-R1 ───────────────────────────────────────╮[/dim]")
+                            console.print(f"\n[dim]╭─── 🧠 Рассуждения {provider.display_name} ─────────────────────────────────╮[/dim]")
                             sys.stdout.write("\033[90m")
                             in_thinking = True
                         sys.stdout.write(chunk.text)
                         sys.stdout.flush()
                     elif self.thinking_mode == "hide":
                         if not in_thinking:
-                            sys.stdout.write("\r\033[90m🧠 DeepSeek-R1 рассуждает...\033[0m")
+                            sys.stdout.write(f"\r\033[90m🧠 {provider.display_name} рассуждает...\033[0m")
                             sys.stdout.flush()
                             in_thinking = True
 
@@ -237,7 +287,7 @@ class DeepSeekCLI:
                         in_thinking = False
 
                     if not in_content:
-                        console.print("[bold cyan]DeepSeek:[/bold cyan]")
+                        console.print(f"[bold cyan]{provider.display_name}:[/bold cyan]")
                         in_content = True
 
                     sys.stdout.write(chunk.text)
@@ -250,7 +300,7 @@ class DeepSeekCLI:
             print("\n", flush=True)
 
             sid = session_manager.get_current_session_id() or ""
-            info_str = f"[dim]Сессия: {sid[:8]}... | Использовано токенов: {tokens_count or 'N/A'}[/dim]\n"
+            info_str = f"[dim]Провайдер: {provider.display_name} | Модель: {self.model} | Использовано токенов: {tokens_count or 'N/A'}[/dim]\n"
             console.print(info_str)
 
         except Exception as e:
@@ -259,18 +309,6 @@ class DeepSeekCLI:
     async def run(self):
         await self.init()
         self.print_banner()
-
-        if not credentials_manager.is_authenticated():
-            console.print("[bold yellow]Внимание:[/bold yellow] Токен авторизации не найден.")
-            try:
-                user_token = await self.session.prompt_async("Вставьте ваш Bearer токен (chat.deepseek.com): ")
-                user_token = user_token.strip()
-                if user_token:
-                    credentials_manager.save(user_token)
-                    console.print("[green]✓ Токен успешно сохранен и активирован![/green]\n")
-                    self.print_status()
-            except (KeyboardInterrupt, EOFError):
-                return
 
         while True:
             try:
@@ -297,12 +335,24 @@ class DeepSeekCLI:
                     elif cmd == "/clear":
                         os.system("cls" if os.name == "nt" else "clear")
                         self.print_banner()
-                    elif cmd == "/token":
+                    elif cmd == "/provider":
                         if not arg:
-                            console.print("[red]Использование:[/red] /token <bearer_token>")
+                            console.print("[yellow]Использование:[/yellow] /provider <deepseek | qwen | glm>")
                         else:
-                            credentials_manager.save(arg)
-                            console.print("[green]✓ Токен успешно сохранен и активирован![/green]")
+                            self.set_provider_and_default_model(arg)
+                        self.print_status()
+                    elif cmd == "/token":
+                        token_parts = arg.split(maxsplit=1)
+                        if len(token_parts) == 0 or not token_parts[0]:
+                            console.print("[red]Использование:[/red] /token <токен> ИЛИ /token <provider> <токен>")
+                        elif len(token_parts) == 1:
+                            credentials_manager.save(token_parts[0], provider=self.provider_id)
+                            console.print(f"[green]✓ Токен для {self.provider_id} успешно сохранен![/green]")
+                            self.print_status()
+                        else:
+                            p_name, p_tok = token_parts[0].lower(), token_parts[1]
+                            credentials_manager.save(p_tok, provider=p_name)
+                            console.print(f"[green]✓ Токен для {p_name} успешно сохранен![/green]")
                             self.print_status()
                     elif cmd == "/new":
                         session_manager.reset_context()
@@ -312,84 +362,41 @@ class DeepSeekCLI:
                         arg_lower = arg.lower()
                         if arg_lower in ["show", "on"]:
                             self.thinking_mode = "show"
-                            self.model = "deepseek-reasoner"
-                            console.print("[green]✓ Режим R1: рассуждения отображаются в отдельном блоке[/green]")
+                            console.print("[green]✓ Режим рассуждений: мысли отображаются в отдельном блоке[/green]")
                         elif arg_lower in ["hide", "hidden"]:
                             self.thinking_mode = "hide"
-                            self.model = "deepseek-reasoner"
-                            console.print("[yellow]✓ Режим R1: рассуждения скрыты (только финальный ответ)[/yellow]")
+                            console.print("[yellow]✓ Режим рассуждений: мысли скрыты (только финальный ответ)[/yellow]")
                         elif arg_lower == "off":
                             self.thinking_mode = "off"
-                            if self.model == "deepseek-reasoner":
-                                self.model = "deepseek-chat"
-                            console.print("[yellow]✓ Режим рассуждений ВЫКЛЮЧЕН (модель deepseek-chat)[/yellow]")
+                            console.print("[yellow]✓ Режим рассуждений ВЫКЛЮЧЕН[/yellow]")
                         else:
                             if self.thinking_mode == "off":
                                 self.thinking_mode = "show"
-                                self.model = "deepseek-reasoner"
                             elif self.thinking_mode == "show":
                                 self.thinking_mode = "hide"
                             else:
                                 self.thinking_mode = "off"
-                                self.model = "deepseek-chat"
                         self.print_status()
                     elif cmd == "/search":
                         if arg.lower() == "on":
                             self.search_enabled = True
-                            self.model = "deepseek-search"
-                            self.thinking_mode = "off"
-                            console.print("[green]✓ Веб-поиск ВКЛЮЧЕН (модель deepseek-search)[/green]")
+                            console.print("[green]✓ Веб-поиск ВКЛЮЧЕН[/green]")
                         elif arg.lower() == "off":
                             self.search_enabled = False
-                            if self.model == "deepseek-search":
-                                self.model = "deepseek-chat"
-                            console.print("[yellow]✓ Веб-поиск ВЫКЛЮЧЕН (модель deepseek-chat)[/yellow]")
+                            console.print("[yellow]✓ Веб-поиск ВЫКЛЮЧЕН[/yellow]")
                         else:
                             self.search_enabled = not self.search_enabled
-                            if self.search_enabled:
-                                self.model = "deepseek-search"
-                                self.thinking_mode = "off"
-                            elif self.model == "deepseek-search":
-                                self.model = "deepseek-chat"
                             console.print(f"Веб-поиск: {'[green]ВКЛ[/green]' if self.search_enabled else '[dim]ВЫКЛ[/dim]'}")
                         self.print_status()
                     elif cmd == "/model":
                         arg_clean = arg.lower().strip()
-                        if arg_clean in ["deepseek-v4-pro", "v4-pro", "v4", "pro"]:
-                            self.model = "deepseek-v4-pro"
-                            self.search_enabled = False
-                            if self.thinking_mode == "off":
-                                self.thinking_mode = "show"
-                            console.print("[green]✓ Выбрана модель: DeepSeek V4 Pro 1.6T MoE (рассуждения + сложный код)[/green]")
-                        elif arg_clean in ["deepseek-v4-flash", "v4-flash", "flash"]:
-                            self.model = "deepseek-v4-flash"
-                            self.search_enabled = False
-                            self.thinking_mode = "off"
-                            console.print("[green]✓ Выбрана модель: DeepSeek V4 Flash 284B MoE (высокая скорость)[/green]")
-                        elif arg_clean in ["deepseek-v4-flash-vision-exp", "v4-vision", "vision"]:
-                            self.model = "deepseek-v4-flash-vision-exp"
-                            self.search_enabled = False
-                            self.thinking_mode = "off"
-                            console.print("[green]✓ Выбрана модель: DeepSeek V4 Flash Vision (мультимодальная)[/green]")
-                        elif arg_clean in ["reasoner", "r1", "deepseek-reasoner"]:
-                            self.model = "deepseek-reasoner"
-                            self.search_enabled = False
-                            if self.thinking_mode == "off":
-                                self.thinking_mode = "show"
-                            console.print("[green]✓ Выбрана модель: DeepSeek R1 (Reasoner)[/green]")
-                        elif arg_clean in ["search", "deepseek-search"]:
-                            self.model = "deepseek-search"
-                            self.search_enabled = True
-                            self.thinking_mode = "off"
-                            console.print("[green]✓ Выбрана модель: DeepSeek V3 (Web Search)[/green]")
-                        elif arg_clean in ["chat", "expert", "deepseek-chat", ""]:
-                            self.model = "deepseek-chat"
-                            self.search_enabled = False
-                            self.thinking_mode = "off"
-                            console.print("[green]✓ Выбрана модель: DeepSeek V3 (Chat)[/green]")
+                        if not arg_clean:
+                            console.print(f"[cyan]Текущая модель:[/cyan] {self.model}")
                         else:
-                            self.model = arg
-                            console.print(f"[green]✓ Установлена модель: {self.model}[/green]")
+                            target_provider = provider_registry.resolve_provider_for_model(arg_clean)
+                            self.provider_id = target_provider.provider_id
+                            self.model = arg_clean
+                            console.print(f"[green]✓ Выбрана модель: {self.model} (Провайдер: {target_provider.display_name})[/green]")
                         self.print_status()
                     else:
                         console.print(f"[red]Неизвестная команда:[/red] {cmd}. Введите [bold]/help[/bold].")
@@ -405,7 +412,7 @@ class DeepSeekCLI:
 
 
 def main():
-    cli = DeepSeekCLI()
+    cli = MultiProviderCLI()
     asyncio.run(cli.run())
 
 

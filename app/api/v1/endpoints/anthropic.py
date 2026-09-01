@@ -3,8 +3,10 @@ import uuid
 from typing import Annotated, AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
+import httpx
 
-from app.api.deps import get_deepseek_client
+from app.api.deps import get_http_client
+from app.providers.registry import provider_registry
 from app.schemas.anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -13,17 +15,16 @@ from app.services.anthropic_converter import (
     convert_anthropic_request_to_deepseek,
     convert_deepseek_response_to_anthropic,
 )
-from app.services.deepseek_client import DeepSeekClient
 from app.services.tool_parser import extract_tool_calls
 
 router = APIRouter(tags=["Anthropic"])
 
 
-@router.post("/v1/messages", summary="Anthropic Messages API эндпоинт (/v1/messages)")
-@router.post("/api/v1/messages", summary="Anthropic Messages API эндпоинт (/api/v1/messages)")
+@router.post("/v1/messages", summary="Anthropic Messages API эндпоинт (/v1/messages с мульти-провайдерами)")
+@router.post("/api/v1/messages", summary="Anthropic Messages API эндпоинт (/api/v1/messages с мульти-провайдерами)")
 async def anthropic_messages(
     request: AnthropicMessagesRequest,
-    client: Annotated[DeepSeekClient, Depends(get_deepseek_client)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
     if not request.messages:
         raise HTTPException(
@@ -31,6 +32,7 @@ async def anthropic_messages(
             detail="Поле messages обязательно и не может быть пустым."
         )
 
+    provider = provider_registry.resolve_provider_for_model(request.model)
     deepseek_req, has_tools = convert_anthropic_request_to_deepseek(request)
     msg_id = f"msg_{uuid.uuid4().hex[:20]}"
 
@@ -56,7 +58,7 @@ async def anthropic_messages(
             in_text_block = False
             accumulated_content = []
 
-            async for chunk in client.stream_chat(deepseek_req):
+            async for chunk in provider.stream_chat(deepseek_req):
                 if chunk.type == "thinking":
                     if not in_thinking_block:
                         cb_start = {
@@ -203,5 +205,5 @@ async def anthropic_messages(
         )
 
     else:
-        resp = await client.send_message(deepseek_req)
+        resp = await provider.send_message(deepseek_req)
         return convert_deepseek_response_to_anthropic(resp, model=request.model, has_tools=has_tools)

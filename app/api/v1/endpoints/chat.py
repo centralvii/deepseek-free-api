@@ -4,8 +4,10 @@ import uuid
 from typing import Annotated, AsyncGenerator, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
+import httpx
 
-from app.api.deps import get_deepseek_client
+from app.api.deps import get_http_client
+from app.providers.registry import provider_registry
 from app.schemas.chat import DeepSeekChatRequest, DeepSeekChatResponse, StreamChunk
 from app.schemas.openai import (
     OpenAIChatCompletionChunk,
@@ -20,20 +22,21 @@ from app.schemas.openai import (
     OpenAIToolCall,
     OpenAIUsage,
 )
-from app.services.deepseek_client import DeepSeekClient
 from app.services.tool_parser import extract_tool_calls, format_messages_to_prompt
 
 router = APIRouter(tags=["Chat"])
 
 
-@router.post("/api/v1/chat/send", summary="Отправить сообщение в DeepSeek (Native)")
+@router.post("/api/v1/chat/send", summary="Отправить сообщение (Native, с автовыбором провайдера по модели)")
 async def send_chat_message(
     request: DeepSeekChatRequest,
-    client: Annotated[DeepSeekClient, Depends(get_deepseek_client)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
+    provider = provider_registry.resolve_provider_for_model(request.model)
+
     if request.stream:
         async def event_generator() -> AsyncGenerator[str, None]:
-            async for chunk in client.stream_chat(request):
+            async for chunk in provider.stream_chat(request):
                 yield f"data: {chunk.model_dump_json()}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -47,19 +50,21 @@ async def send_chat_message(
             },
         )
     else:
-        return await client.send_message(request)
+        return await provider.send_message(request)
 
 
-@router.post("/v1/chat/completions", summary="OpenAI-совместимый эндпоинт чата (с поддержкой Tool-Use и Cline)")
+@router.post("/v1/chat/completions", summary="OpenAI-совместимый эндпоинт чата (с мульти-провайдерами, Tool-Use и Cline)")
 async def openai_chat_completions(
     request: OpenAIChatCompletionRequest,
-    client: Annotated[DeepSeekClient, Depends(get_deepseek_client)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
     if not request.messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Массив messages не может быть пустым"
         )
+
+    provider = provider_registry.resolve_provider_for_model(request.model)
 
     compiled_prompt = format_messages_to_prompt(request.messages, request.tools)
 
@@ -84,7 +89,7 @@ async def openai_chat_completions(
             accumulated_content = []
             has_tools = bool(request.tools)
 
-            async for chunk in client.stream_chat(deepseek_req):
+            async for chunk in provider.stream_chat(deepseek_req):
                 if chunk.type == "thinking":
                     c = OpenAIChatCompletionChunk(
                         id=req_id,
@@ -156,7 +161,7 @@ async def openai_chat_completions(
         )
 
     else:
-        resp = await client.send_message(deepseek_req)
+        resp = await provider.send_message(deepseek_req)
 
         clean_text = resp.content
         tool_calls: Optional[List[OpenAIToolCall]] = None

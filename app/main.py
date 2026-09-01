@@ -7,6 +7,7 @@ import httpx
 from app.api.v1.api_router import api_router
 from app.core.config import settings
 from app.core.credentials import credentials_manager
+from app.providers.registry import provider_registry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,11 +25,14 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
     )
 
-    if credentials_manager.is_authenticated():
-        logger.info("Учетные данные DeepSeek загружены и готовы к работе")
+    provider_registry.init_providers(app.state.http_client)
+
+    active_providers = [p["name"] for p in provider_registry.list_providers() if p["authenticated"]]
+    if active_providers:
+        logger.info(f"Активные провайдеры с токенами: {', '.join(active_providers)}")
     else:
         logger.warning(
-            "ВНИМАНИЕ: Учетные данные DeepSeek не найдены. Сохраните токен через /api/v1/auth/token или в credentials.json."
+            "ВНИМАНИЕ: Учетные данные провайдеров не найдены. Сохраните токен через /api/v1/auth/token или credentials.json."
         )
 
     yield
@@ -62,12 +66,17 @@ def create_app() -> FastAPI:
             "app": settings.APP_NAME,
             "version": settings.APP_VERSION,
             "docs": "/docs",
-            "authenticated": credentials_manager.is_authenticated(),
+            "default_provider": provider_registry.default_provider_id,
+            "providers": provider_registry.list_providers(),
         }
 
     @app.get("/health", tags=["General"])
     async def health():
-        return {"status": "ok", "authenticated": credentials_manager.is_authenticated()}
+        return {
+            "status": "ok",
+            "default_provider": provider_registry.default_provider_id,
+            "providers": provider_registry.list_providers(),
+        }
 
     return app
 
