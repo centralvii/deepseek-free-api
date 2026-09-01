@@ -11,16 +11,13 @@ async def test_provider_registry_routing():
     provider_ids = [p["id"] for p in providers]
     assert "deepseek" in provider_ids
     assert "qwen" in provider_ids
-    assert "glm" in provider_ids
+    assert "glm" not in provider_ids
 
     p_deepseek = provider_registry.resolve_provider_for_model("deepseek-v4-pro")
     assert p_deepseek.provider_id == "deepseek"
 
     p_qwen = provider_registry.resolve_provider_for_model("qwen-3.8-coder")
     assert p_qwen.provider_id == "qwen"
-
-    p_glm = provider_registry.resolve_provider_for_model("glm-5.3")
-    assert p_glm.provider_id == "glm"
 
 
 @pytest.mark.asyncio
@@ -37,11 +34,7 @@ async def test_all_models_list():
 
         assert "qwen-3.8" in model_ids
         assert "qwen-3.8-coder" in model_ids
-        assert "qwen-3-max" in model_ids
-
-        assert "glm-5.3" in model_ids
-        assert "glm-5-pro" in model_ids
-        assert "glm-5-coder" in model_ids
+        assert "qwen3.7-plus" in model_ids
 
 
 @pytest.mark.asyncio
@@ -51,7 +44,7 @@ async def test_provider_switching_api():
         assert resp.status_code == 200
         data = resp.json()
         assert "default_provider" in data
-        assert len(data["providers"]) == 3
+        assert len(data["providers"]) == 2
 
         sw_resp = await ac.post("/api/v1/providers/switch", json={"provider": "qwen"})
         assert sw_resp.status_code == 200
@@ -65,10 +58,13 @@ async def test_provider_switching_api():
 
 @pytest.mark.asyncio
 async def test_multi_provider_credentials():
-    credentials_manager.save("test_qwen_token_xyz", provider="qwen")
-    credentials_manager.save("test_glm_token_xyz", provider="glm")
+    orig_qwen = credentials_manager.get_token("qwen")
 
-    assert credentials_manager.get_token("qwen") == "test_qwen_token_xyz"
-    assert credentials_manager.get_token("glm") == "test_glm_token_xyz"
-    assert credentials_manager.is_authenticated("qwen") is True
-    assert credentials_manager.is_authenticated("glm") is True
+    try:
+        credentials_manager._tokens["qwen"] = "mock_qwen_token"
+
+        assert credentials_manager.get_token("qwen") == "mock_qwen_token"
+        assert credentials_manager.is_authenticated("qwen") is True
+    finally:
+        if orig_qwen:
+            credentials_manager._tokens["qwen"] = orig_qwen

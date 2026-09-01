@@ -39,7 +39,7 @@ class MultiProviderCommandCompleter(Completer):
     """Динамическое автодополнение команд и моделей для всех провайдеров."""
 
     COMMANDS = {
-        "/provider": "Переключить активного провайдера (deepseek, qwen, glm)",
+        "/provider": "Переключить активного провайдера (deepseek, qwen)",
         "/model": "Переключить модель LLM",
         "/token": "Установить Bearer токен (например, /token qwen <токен>)",
         "/think": "Режим рассуждений/мыслей (show / hide / off)",
@@ -57,8 +57,7 @@ class MultiProviderCommandCompleter(Completer):
     SUBCOMMANDS = {
         "/provider": {
             "deepseek": "DeepSeek (V4 Pro, V4 Flash, R1 Reasoner, V3)",
-            "qwen": "Qwen Alibaba (Qwen 3.8, 3.8-Coder, 3-Max, 3-Plus)",
-            "glm": "GLM Zhipu AI (GLM 5.3, 5-Pro, 5-Coder, 5-Flash)",
+            "qwen": "Qwen Alibaba (Qwen 3.7 Plus, 3.8, 3.8-Coder, 3-Max, 3-Plus)",
         },
         "/think": {
             "show": "Включить рассуждения и показывать блок мыслей",
@@ -85,17 +84,10 @@ class MultiProviderCommandCompleter(Completer):
             "qwen-3-max": "[Qwen] Максимальная интеллектуальная мощность",
             "qwen-3-plus": "[Qwen] Быстрый универсальный ассистент",
             "qwen-3-flash": "[Qwen] Zero-Latency мгновенные ответы",
-            # GLM
-            "glm-5.3": "[GLM] Новейший флагман 5.3 с глубоким пониманием",
-            "glm-5-pro": "[GLM] Профессиональная модель рассуждений",
-            "glm-5-coder": "[GLM] Специализированная модель для разработки и аудита",
-            "glm-5-flash": "[GLM] Сверхбыстрая легковесная модель",
-            "glm-4-plus": "[GLM] Проверенная модель GLM-4 Plus",
         },
         "/token": {
             "deepseek": "Установить токен для DeepSeek",
             "qwen": "Установить токен для Qwen",
-            "glm": "Установить токен для GLM",
         }
     }
 
@@ -154,6 +146,13 @@ class MultiProviderCLI:
     def is_thinking_enabled(self) -> bool:
         return self.thinking_mode in ["show", "hide"]
 
+    def get_active_session_id(self) -> Optional[str]:
+        try:
+            prov = provider_registry.get_provider(self.provider_id)
+            return prov.get_current_session_id() or session_manager.get_current_session_id()
+        except Exception:
+            return session_manager.get_current_session_id()
+
     def get_bottom_toolbar(self):
         prov_name = provider_registry.get_provider(self.provider_id).display_name
         if self.thinking_mode == "show":
@@ -164,7 +163,7 @@ class MultiProviderCLI:
             think_str = "🧠 Мысли: ВЫКЛ"
 
         search_str = "🌐 Поиск: ВКЛ" if self.search_enabled else "🌐 Поиск: ВЫКЛ"
-        sid = session_manager.get_current_session_id()
+        sid = self.get_active_session_id()
         session_short = (sid[:8] + "...") if sid else "новая"
         return f" [{prov_name}] | [Модель: {self.model}] | [{think_str}] | [{search_str}] | [Сессия: {session_short}] "
 
@@ -172,7 +171,7 @@ class MultiProviderCLI:
         banner = """
 [bold cyan]╔══════════════════════════════════════════════════════════════════╗
 ║             Multi-LLM Reverse-Engineered Web CLI                 ║
-║       DeepSeek V4/R1  •  Qwen 3.8/Coder  •  GLM 5.3/Pro          ║
+║       DeepSeek V4/R1       •       Qwen 3.7 Plus / 3.8           ║
 ╚══════════════════════════════════════════════════════════════════╝[/bold cyan]
         """
         console.print(banner)
@@ -183,7 +182,7 @@ class MultiProviderCLI:
         provider = provider_registry.get_provider(self.provider_id)
         is_auth = provider.is_authenticated()
         auth_status = f"[green]✓ Авторизован ({provider.display_name})[/green]" if is_auth else f"[bold red]✗ Нет токена ({provider.display_name})[/bold red]"
-        session_id = session_manager.get_current_session_id() or "[dim]не создана (будет создана при первом запросе)[/dim]"
+        session_id = self.get_active_session_id() or "[dim]не создана (будет создана при первом запросе)[/dim]"
 
         if self.thinking_mode == "show":
             think_label = "[green]ВКЛ (показывать блок мыслей)[/green]"
@@ -204,15 +203,15 @@ class MultiProviderCLI:
             f"  • [bold]Выбранная модель:[/bold] [yellow]{self.model}[/yellow]\n"
             f"  • [bold]Thinking / Рассуждения:[/bold] {think_label}\n"
             f"  • [bold]Web Search:[/bold] {'[green]ВКЛ[/green]' if self.search_enabled else '[dim]ВЫКЛ[/dim]'}\n"
-            f"  • [bold]ID Сессии:[/bold] {session_id}"
+            f"  • [bold]ID Сессии:[/bold] [cyan]{session_id}[/cyan]"
         )
         console.print(Panel(status_table, title="[bold]Панель состояния[/bold]", border_style="blue"))
 
     def print_help(self):
         help_text = """
 [bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
-  [bold yellow]/provider <deepseek|qwen|glm>[/bold yellow] - Переключить активного провайдера
-  [bold yellow]/model <name>[/bold yellow]                 - Переключить модель (v4-pro, qwen3.7-plus, glm-5.3 и др.)
+  [bold yellow]/provider <deepseek|qwen>[/bold yellow]    - Переключить активного провайдера
+  [bold yellow]/model <name>[/bold yellow]                 - Переключить модель (v4-pro, qwen3.7-plus, qwen-3.8-coder и др.)
   [bold yellow]/token [provider] <token>[/bold yellow]     - Установить Bearer токен для провайдера
   [bold yellow]/think [show|hide|off][/bold yellow]      - Режим мыслей: показывать, скрывать или выключить
   [bold yellow]/search [on|off][/bold yellow]              - Включить/выключить поиск в интернете
@@ -232,18 +231,13 @@ class MultiProviderCLI:
             self.model = "qwen3.7-plus"
             provider_registry.set_default_provider("qwen")
             console.print("[green]✓ Переключено на Qwen (по умолчанию модель qwen3.7-plus)[/green]")
-        elif pid == "glm":
-            self.provider_id = "glm"
-            self.model = "glm-5.3"
-            provider_registry.set_default_provider("glm")
-            console.print("[green]✓ Переключено на GLM (по умолчанию модель glm-5.3)[/green]")
         elif pid == "deepseek":
             self.provider_id = "deepseek"
             self.model = "deepseek-v4-pro"
             provider_registry.set_default_provider("deepseek")
             console.print("[green]✓ Переключено на DeepSeek (по умолчанию модель deepseek-v4-pro)[/green]")
         else:
-            console.print(f"[red]Неизвестный провайдер:[/red] {pid}. Доступные: deepseek, qwen, glm")
+            console.print(f"[red]Неизвестный провайдер:[/red] {pid}. Доступные: deepseek, qwen")
 
     async def handle_chat(self, user_input: str):
         provider = provider_registry.resolve_provider_for_model(self.model)
@@ -257,6 +251,7 @@ class MultiProviderCLI:
 
         req = DeepSeekChatRequest(
             prompt=user_input,
+            chat_session_id=provider.get_current_session_id(),
             model=self.model,
             thinking_enabled=self.is_thinking_enabled,
             search_enabled=self.search_enabled,
@@ -269,6 +264,9 @@ class MultiProviderCLI:
 
         try:
             async for chunk in provider.stream_chat(req):
+                if chunk.session_id:
+                    provider.set_session_id(chunk.session_id)
+
                 if chunk.token_usage:
                     tokens_count = chunk.token_usage
 
@@ -311,8 +309,8 @@ class MultiProviderCLI:
 
             print("\n", flush=True)
 
-            sid = session_manager.get_current_session_id() or getattr(provider, "_current_chat_id", None) or ""
-            info_str = f"[dim]Провайдер: {provider.display_name} | Модель: {self.model} | Использовано токенов: {tokens_count or 'N/A'}[/dim]\n"
+            sid = provider.get_current_session_id() or session_manager.get_current_session_id() or "новая"
+            info_str = f"[dim]Провайдер: {provider.display_name} | Модель: {self.model} | Сессия: {sid} | Использовано токенов: {tokens_count or 'N/A'}[/dim]\n"
             console.print(info_str)
 
         except Exception as e:
@@ -349,7 +347,7 @@ class MultiProviderCLI:
                         self.print_banner()
                     elif cmd == "/provider":
                         if not arg:
-                            console.print("[yellow]Использование:[/yellow] /provider <deepseek | qwen | glm>")
+                            console.print("[yellow]Использование:[/yellow] /provider <deepseek | qwen>")
                         else:
                             self.set_provider_and_default_model(arg)
                         self.print_status()
@@ -370,8 +368,7 @@ class MultiProviderCLI:
                         session_manager.reset_context()
                         try:
                             cur_p = provider_registry.get_provider(self.provider_id)
-                            if hasattr(cur_p, "reset_session"):
-                                cur_p.reset_session()
+                            cur_p.reset_session()
                         except Exception:
                             pass
                         console.print("[green]✓ Начат новый диалог. Контекст сброшен.[/green]")
