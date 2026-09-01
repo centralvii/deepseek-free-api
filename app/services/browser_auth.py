@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from typing import Optional
 from playwright.async_api import async_playwright
 
@@ -13,12 +14,12 @@ logger = logging.getLogger(__name__)
 async def extract_token_via_browser(
     provider: str = "deepseek",
     headless: bool = False,
-    timeout_seconds: int = 180,
+    timeout_seconds: int = 300,
 ) -> Optional[str]:
     """
     Открывает системный браузер Google Chrome (или Edge),
-    позволяет пользователю войти в аккаунт и автоматически перехватывает
-    и сохраняет рабочий токен авторизации для DeepSeek или Qwen.
+    мгновенно отображает страницу авторизации и непрерывно перехватывает
+    токен авторизации в реальном времени.
     """
     prov = provider.lower().strip()
     profile_dir = os.path.abspath(".browser_profile")
@@ -30,7 +31,6 @@ async def extract_token_via_browser(
 
     async with async_playwright() as p:
         browser = None
-        # Пробуем запустить Google Chrome
         for ch in ["chrome", "msedge"]:
             try:
                 browser = await p.chromium.launch(
@@ -40,9 +40,10 @@ async def extract_token_via_browser(
                         "--disable-blink-features=AutomationControlled",
                         "--no-first-run",
                         "--no-default-browser-check",
+                        "--start-maximized",
                     ],
                 )
-                logger.info(f"Браузер ({ch}) успешно запущен.")
+                logger.info(f"Браузер ({ch}) запущен.")
                 break
             except Exception as e:
                 logger.debug(f"Канал {ch} недоступен: {e}")
@@ -55,7 +56,7 @@ async def extract_token_via_browser(
                 return None
 
         context_kwargs = {
-            "viewport": {"width": 1280, "height": 850},
+            "no_viewport": True,
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
         }
         if os.path.exists(state_file):
@@ -67,13 +68,12 @@ async def extract_token_via_browser(
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
 
-        # 1. Перехват из исходящих сетевых запросов
+        # 1. Мгновенный перехват заголовков Authorization из сетевого потока
         async def on_request(request):
             nonlocal extracted_token
             req_url = request.url
             auth_hdr = request.headers.get("authorization") or request.headers.get("Authorization")
 
-            # DeepSeek Bearer токен
             if prov == "deepseek":
                 if auth_hdr and "Bearer " in auth_hdr and "chat.deepseek.com" in req_url:
                     tok = auth_hdr.replace("Bearer ", "").strip()
@@ -81,7 +81,6 @@ async def extract_token_via_browser(
                         extracted_token = tok
                         logger.info("Токен DeepSeek перехвачен из сетевого запроса!")
 
-            # Qwen Bearer токен
             elif prov == "qwen":
                 if auth_hdr and "Bearer " in auth_hdr and "chat.qwen.ai" in req_url:
                     tok = auth_hdr.replace("Bearer ", "").strip()
@@ -91,14 +90,19 @@ async def extract_token_via_browser(
 
         page.on("request", on_request)
 
+        # 2. Мгновенный переход без блокировки загрузки (wait_until='commit')
         try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(target_url, wait_until="commit", timeout=60000)
         except Exception as e:
-            logger.warning(f"Ошибка перехода на {target_url}: {e}")
+            logger.warning(f"Навигация: {e}")
 
-        # 2. Периодический опрос localStorage и Cookies
-        for _ in range(timeout_seconds):
+        # 3. Цикл непрерывного мониторинга входа
+        for sec in range(timeout_seconds):
             if extracted_token:
+                break
+
+            # Если пользователь вручную закрыл страницу
+            if page.is_closed():
                 break
 
             try:
@@ -158,10 +162,9 @@ async def extract_token_via_browser(
 
 
 if __name__ == "__main__":
-    import sys
     prov_arg = sys.argv[1] if len(sys.argv) > 1 else "deepseek"
     print(f"Запуск окна браузера для {prov_arg}...")
-    res = asyncio.run(extract_token_via_browser(provider=prov_arg, headless=False, timeout_seconds=120))
+    res = asyncio.run(extract_token_via_browser(provider=prov_arg, headless=False, timeout_seconds=300))
     if res:
         print(f"\n[УСПЕХ] Токен для {prov_arg} успешно получен и сохранен в credentials.json!")
     else:
