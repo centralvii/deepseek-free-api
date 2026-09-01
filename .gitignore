@@ -29,6 +29,7 @@ ENV/
 # Credentials & secrets
 .env
 credentials.json
+.browser_profile/
 *.pem
 *.key
 raw_sse_log.txt
