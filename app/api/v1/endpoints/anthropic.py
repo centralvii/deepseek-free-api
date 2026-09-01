@@ -1,9 +1,9 @@
-import json
-import uuid
-from typing import Annotated, AsyncGenerator
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Annotated, AsyncGenerator, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 import httpx
+import json
+import uuid
 
 from app.api.deps import get_http_client
 from app.providers.registry import provider_registry
@@ -24,8 +24,16 @@ router = APIRouter(tags=["Anthropic"])
 @router.post("/api/v1/messages", summary="Anthropic Messages API эндпоинт (/api/v1/messages с мульти-провайдерами)")
 async def anthropic_messages(
     request: AnthropicMessagesRequest,
+    raw_req: Request,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
+    """
+    Эндпоинт, совместимый со спецификацией Anthropic Messages API.
+    Автоматически маршрутизирует модели:
+    - deepseek-v4-pro, claude-* -> DeepSeek
+    - qwen3.7-plus, qwen-3.8, qwen-3.8-coder -> Qwen
+    - Полноценная поддержка Tool Use и Thinking
+    """
     if not request.messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -36,8 +44,29 @@ async def anthropic_messages(
     deepseek_req, has_tools = convert_anthropic_request_to_deepseek(request)
     msg_id = f"msg_{uuid.uuid4().hex[:20]}"
 
+    from app.services.context_compressor import estimate_tokens
+    from app.services.proxy_logger import proxy_logger
+
+    tools_names = [t.name for t in (request.tools or [])]
+    ua = raw_req.headers.get("user-agent", "Anthropic Client")
+    client_ip = raw_req.client.host if raw_req.client else "127.0.0.1"
+
+    log_id = proxy_logger.log_request_start(
+        protocol="Anthropic",
+        endpoint="/v1/messages",
+        model=request.model,
+        provider_name=provider.display_name,
+        messages_count=len(request.messages),
+        estimated_tokens=estimate_tokens(deepseek_req.prompt or ""),
+        tools_names=tools_names,
+        user_agent=ua,
+        client_ip=client_ip,
+    )
+
+    # --- 1. Потоковый режим (Anthropic SSE Streaming) ---
     if request.stream:
         async def anthropic_sse_generator() -> AsyncGenerator[str, None]:
+            # 1. message_start
             start_event = {
                 "type": "message_start",
                 "message": {
@@ -58,141 +87,155 @@ async def anthropic_messages(
             in_text_block = False
             accumulated_content = []
 
-            async for chunk in provider.stream_chat(deepseek_req):
-                if chunk.type == "thinking":
-                    if not in_thinking_block:
-                        cb_start = {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        }
-                        yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                        in_thinking_block = True
-
-                    cb_delta = {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "thinking_delta", "thinking": chunk.text},
-                    }
-                    yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-
-                elif chunk.type == "content":
-                    if in_thinking_block:
-                        cb_stop = {"type": "content_block_stop", "index": block_index}
-                        yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                        in_thinking_block = False
-                        block_index += 1
-
-                    accumulated_content.append(chunk.text)
-
-                    if not has_tools:
-                        if not in_text_block:
+            try:
+                async for chunk in provider.stream_chat(deepseek_req):
+                    # Блок рассуждений (Thinking)
+                    if chunk.type == "thinking":
+                        proxy_logger.log_thinking_chunk(log_id, chunk.text)
+                        if not in_thinking_block:
                             cb_start = {
                                 "type": "content_block_start",
                                 "index": block_index,
-                                "content_block": {"type": "text", "text": ""},
+                                "content_block": {"type": "thinking", "thinking": ""},
                             }
                             yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                            in_text_block = True
+                            in_thinking_block = True
 
                         cb_delta = {
                             "type": "content_block_delta",
                             "index": block_index,
-                            "delta": {"type": "text_delta", "text": chunk.text},
+                            "delta": {"type": "thinking_delta", "thinking": chunk.text},
                         }
                         yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
 
-            if in_thinking_block:
-                cb_stop = {"type": "content_block_stop", "index": block_index}
-                yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                in_thinking_block = False
-                block_index += 1
+                    # Блок текста ответа (Content)
+                    elif chunk.type == "content":
+                        proxy_logger.log_content_chunk(log_id, chunk.text)
+                        if in_thinking_block:
+                            cb_stop = {"type": "content_block_stop", "index": block_index}
+                            yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                            in_thinking_block = False
+                            block_index += 1
 
-            stop_reason = "end_turn"
-            full_text = "".join(accumulated_content)
+                        accumulated_content.append(chunk.text)
 
-            if has_tools:
-                clean_text, tool_calls = extract_tool_calls(full_text)
-                if clean_text:
-                    cb_start = {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                    yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                    cb_delta = {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "text_delta", "text": clean_text},
-                    }
-                    yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+                        if not has_tools:
+                            if not in_text_block:
+                                cb_start = {
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+                                in_text_block = True
+
+                            cb_delta = {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": chunk.text},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+
+                if in_thinking_block:
                     cb_stop = {"type": "content_block_stop", "index": block_index}
                     yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                    in_thinking_block = False
                     block_index += 1
 
-                if tool_calls:
-                    stop_reason = "tool_use"
-                    for tc in tool_calls:
-                        try:
-                            args_dict = json.loads(tc.function.arguments)
-                        except Exception:
-                            args_dict = {"raw": tc.function.arguments}
+                stop_reason = "end_turn"
+                full_text = "".join(accumulated_content)
 
-                        tu_id = f"toolu_{uuid.uuid4().hex[:16]}"
+                # Если были запрошены инструменты, проверяем наличие tool_calls
+                if has_tools:
+                    clean_text, tool_calls = extract_tool_calls(full_text)
+                    if clean_text:
                         cb_start = {
                             "type": "content_block_start",
                             "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tu_id,
-                                "name": tc.function.name,
-                                "input": {},
-                            },
+                            "content_block": {"type": "text", "text": ""},
                         }
                         yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-
                         cb_delta = {
                             "type": "content_block_delta",
                             "index": block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps(args_dict, ensure_ascii=False),
-                            },
+                            "delta": {"type": "text_delta", "text": clean_text},
                         }
                         yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-
                         cb_stop = {"type": "content_block_stop", "index": block_index}
                         yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
                         block_index += 1
-                elif not clean_text and full_text:
-                    cb_start = {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                    yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                    cb_delta = {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "text_delta", "text": full_text},
-                    }
-                    yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-                    cb_stop = {"type": "content_block_stop", "index": block_index}
-                    yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                    block_index += 1
-            else:
-                if in_text_block:
-                    cb_stop = {"type": "content_block_stop", "index": block_index}
-                    yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
 
-            msg_delta = {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": len(accumulated_content)},
-            }
-            yield f"event: message_delta\ndata: {json.dumps(msg_delta, ensure_ascii=False)}\n\n"
+                    if tool_calls:
+                        stop_reason = "tool_use"
+                        for tc in tool_calls:
+                            proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
+                            try:
+                                args_dict = json.loads(tc.function.arguments)
+                            except Exception:
+                                args_dict = {"raw": tc.function.arguments}
 
-            yield "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+                            tu_id = f"toolu_{uuid.uuid4().hex[:16]}"
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": tu_id,
+                                    "name": tc.function.name,
+                                    "input": {},
+                                },
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+
+                            cb_delta = {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps(args_dict, ensure_ascii=False),
+                                },
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+
+                            cb_stop = {"type": "content_block_stop", "index": block_index}
+                            yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                            block_index += 1
+                    elif not clean_text and full_text:
+                        cb_start = {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        }
+                        yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+                        cb_delta = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "text_delta", "text": full_text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+                        cb_stop = {"type": "content_block_stop", "index": block_index}
+                        yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                        block_index += 1
+                else:
+                    if in_text_block:
+                        cb_stop = {"type": "content_block_stop", "index": block_index}
+                        yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+
+                # message_delta
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": len(accumulated_content)},
+                }
+                yield f"event: message_delta\ndata: {json.dumps(msg_delta, ensure_ascii=False)}\n\n"
+
+                # message_stop
+                yield "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+                proxy_logger.log_request_end(log_id, status_code=200, tokens_out=len(accumulated_content))
+
+            except Exception as e:
+                proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
+                raise
 
         return StreamingResponse(
             anthropic_sse_generator(),
@@ -204,6 +247,13 @@ async def anthropic_messages(
             },
         )
 
+    # --- 2. Синхронный режим (Non-streaming) ---
     else:
-        resp = await provider.send_message(deepseek_req)
-        return convert_deepseek_response_to_anthropic(resp, model=request.model, has_tools=has_tools)
+        try:
+            resp = await provider.send_message(deepseek_req)
+            result = convert_deepseek_response_to_anthropic(resp, model=request.model, has_tools=has_tools)
+            proxy_logger.log_request_end(log_id, status_code=200, tokens_out=resp.token_usage or 0)
+            return result
+        except Exception as e:
+            proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
+            raise

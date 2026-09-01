@@ -2,7 +2,7 @@ import json
 import time
 import uuid
 from typing import Annotated, AsyncGenerator, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 import httpx
 
@@ -60,14 +60,14 @@ async def send_chat_message(
 @router.post("/v1/chat/completions", summary="OpenAI-совместимый эндпоинт чата (с мульти-провайдерами, Tool-Use и Cline)")
 async def openai_chat_completions(
     request: OpenAIChatCompletionRequest,
+    raw_req: Request,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
     """
     Эндпоинт, на 100% совместимый с форматом OpenAI API (/v1/chat/completions).
     Автоматически маршрутизирует модели:
     - deepseek-v4-pro, deepseek-reasoner, deepseek-chat -> DeepSeek
-    - qwen-3.8, qwen-3.8-coder, qwen-3-max -> Qwen
-    - glm-5.3, glm-5-pro, glm-5-coder -> GLM
+    - qwen3.7-plus, qwen-3.8, qwen-3.8-coder, qwen-3-max -> Qwen
     - Поддерживает Tool Use (Function Calling) и передачу reasoning_content
     """
     if not request.messages:
@@ -89,6 +89,24 @@ async def openai_chat_completions(
     )
 
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    tools_names = [t.function.name for t in (request.tools or []) if t.function]
+    ua = raw_req.headers.get("user-agent", "OpenAI Client")
+    client_ip = raw_req.client.host if raw_req.client else "127.0.0.1"
+
+    from app.services.context_compressor import estimate_tokens
+    from app.services.proxy_logger import proxy_logger
+
+    log_id = proxy_logger.log_request_start(
+        protocol="OpenAI",
+        endpoint="/v1/chat/completions",
+        model=request.model,
+        provider_name=provider.display_name,
+        messages_count=len(request.messages),
+        estimated_tokens=estimate_tokens(compiled_prompt),
+        tools_names=tools_names,
+        user_agent=ua,
+        client_ip=client_ip,
+    )
 
     # 2. Потоковый режим (Streaming)
     if request.stream:
@@ -104,70 +122,79 @@ async def openai_chat_completions(
             accumulated_content = []
             has_tools = bool(request.tools)
 
-            async for chunk in provider.stream_chat(deepseek_req):
-                # Мысли модели (DeepSeek-R1 / Qwen / GLM)
-                if chunk.type == "thinking":
-                    c = OpenAIChatCompletionChunk(
-                        id=req_id,
-                        model=request.model,
-                        choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
-                    )
-                    yield f"data: {c.model_dump_json()}\n\n"
-
-                # Основной ответ
-                elif chunk.type == "content":
-                    accumulated_content.append(chunk.text)
-                    if not has_tools:
+            try:
+                async for chunk in provider.stream_chat(deepseek_req):
+                    # Мысли модели (DeepSeek-R1 / Qwen)
+                    if chunk.type == "thinking":
+                        proxy_logger.log_thinking_chunk(log_id, chunk.text)
                         c = OpenAIChatCompletionChunk(
                             id=req_id,
                             model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=chunk.text))],
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
                         )
                         yield f"data: {c.model_dump_json()}\n\n"
 
-            # Если были запрошены инструменты, проверяем сгенерированный текст на tool_calls
-            finish_reason = "stop"
-            full_text = "".join(accumulated_content)
-
-            if has_tools:
-                clean_text, tool_calls = extract_tool_calls(full_text)
-                if tool_calls:
-                    finish_reason = "tool_calls"
-                    delta_tools = []
-                    for idx, tc in enumerate(tool_calls):
-                        delta_tools.append(
-                            OpenAIDeltaToolCall(
-                                index=idx,
-                                id=tc.id,
-                                type="function",
-                                function=OpenAIDeltaToolCallFunction(
-                                    name=tc.function.name,
-                                    arguments=tc.function.arguments,
-                                 ),
+                    # Основной ответ
+                    elif chunk.type == "content":
+                        proxy_logger.log_content_chunk(log_id, chunk.text)
+                        accumulated_content.append(chunk.text)
+                        if not has_tools:
+                            c = OpenAIChatCompletionChunk(
+                                id=req_id,
+                                model=request.model,
+                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=chunk.text))],
                             )
-                        )
-                    c = OpenAIChatCompletionChunk(
-                        id=req_id,
-                        model=request.model,
-                        choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=clean_text or None, tool_calls=delta_tools))],
-                    )
-                    yield f"data: {c.model_dump_json()}\n\n"
-                else:
-                    c = OpenAIChatCompletionChunk(
-                        id=req_id,
-                        model=request.model,
-                        choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=full_text))],
-                    )
-                    yield f"data: {c.model_dump_json()}\n\n"
+                            yield f"data: {c.model_dump_json()}\n\n"
 
-            # Завершающий чанк
-            final_chunk = OpenAIChatCompletionChunk(
-                id=req_id,
-                model=request.model,
-                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(), finish_reason=finish_reason)],
-            )
-            yield f"data: {final_chunk.model_dump_json()}\n\n"
-            yield "data: [DONE]\n\n"
+                # Если были запрошены инструменты, проверяем сгенерированный текст на tool_calls
+                finish_reason = "stop"
+                full_text = "".join(accumulated_content)
+
+                if has_tools:
+                    clean_text, tool_calls = extract_tool_calls(full_text)
+                    if tool_calls:
+                        finish_reason = "tool_calls"
+                        delta_tools = []
+                        for idx, tc in enumerate(tool_calls):
+                            proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
+                            delta_tools.append(
+                                OpenAIDeltaToolCall(
+                                    index=idx,
+                                    id=tc.id,
+                                    type="function",
+                                    function=OpenAIDeltaToolCallFunction(
+                                        name=tc.function.name,
+                                        arguments=tc.function.arguments,
+                                    ),
+                                )
+                            )
+                        c = OpenAIChatCompletionChunk(
+                            id=req_id,
+                            model=request.model,
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=clean_text or None, tool_calls=delta_tools))],
+                        )
+                        yield f"data: {c.model_dump_json()}\n\n"
+                    else:
+                        c = OpenAIChatCompletionChunk(
+                            id=req_id,
+                            model=request.model,
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=full_text))],
+                        )
+                        yield f"data: {c.model_dump_json()}\n\n"
+
+                # Завершающий чанк
+                final_chunk = OpenAIChatCompletionChunk(
+                    id=req_id,
+                    model=request.model,
+                    choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(), finish_reason=finish_reason)],
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+                proxy_logger.log_request_end(log_id, status_code=200, tokens_out=len(accumulated_content))
+
+            except Exception as e:
+                proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
+                raise
 
         return StreamingResponse(
             sse_generator(),
@@ -181,38 +208,46 @@ async def openai_chat_completions(
 
     # 3. Синхронный режим (Non-streaming)
     else:
-        resp = await provider.send_message(deepseek_req)
+        try:
+            resp = await provider.send_message(deepseek_req)
 
-        clean_text = resp.content
-        tool_calls: Optional[List[OpenAIToolCall]] = None
-        finish_reason = "stop"
+            clean_text = resp.content
+            tool_calls: Optional[List[OpenAIToolCall]] = None
+            finish_reason = "stop"
 
-        if request.tools:
-            clean_text, found_tool_calls = extract_tool_calls(resp.content)
-            if found_tool_calls:
-                tool_calls = found_tool_calls
-                finish_reason = "tool_calls"
+            if request.tools:
+                clean_text, found_tool_calls = extract_tool_calls(resp.content)
+                if found_tool_calls:
+                    tool_calls = found_tool_calls
+                    finish_reason = "tool_calls"
+                    for tc in found_tool_calls:
+                        proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
 
-        choice_message = OpenAIChoiceMessage(
-            role="assistant",
-            content=clean_text,
-            reasoning_content=resp.thinking or None,
-            tool_calls=tool_calls,
-        )
+            choice_message = OpenAIChoiceMessage(
+                role="assistant",
+                content=clean_text,
+                reasoning_content=resp.thinking or None,
+                tool_calls=tool_calls,
+            )
 
-        return OpenAIChatCompletionResponse(
-            id=req_id,
-            model=request.model,
-            choices=[
-                OpenAIChoice(
-                    index=0,
-                    message=choice_message,
-                    finish_reason=finish_reason,
-                )
-            ],
-            usage=OpenAIUsage(
-                prompt_tokens=0,
-                completion_tokens=resp.token_usage or 0,
-                total_tokens=resp.token_usage or 0,
-            ),
-        )
+            proxy_logger.log_request_end(log_id, status_code=200, tokens_out=resp.token_usage or 0)
+
+            return OpenAIChatCompletionResponse(
+                id=req_id,
+                model=request.model,
+                choices=[
+                    OpenAIChoice(
+                        index=0,
+                        message=choice_message,
+                        finish_reason=finish_reason,
+                    )
+                ],
+                usage=OpenAIUsage(
+                    prompt_tokens=0,
+                    completion_tokens=resp.token_usage or 0,
+                    total_tokens=resp.token_usage or 0,
+                ),
+            )
+        except Exception as e:
+            proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
+            raise

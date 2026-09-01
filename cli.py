@@ -39,6 +39,7 @@ class MultiProviderCommandCompleter(Completer):
     """Динамическое автодополнение команд и моделей для всех провайдеров."""
 
     COMMANDS = {
+        "/proxy": "Режим Proxy-монитора (прослушка и логирование запросов от Cline / Roo / Cursor)",
         "/login": "Войти через окно браузера и автоматически получить токен",
         "/provider": "Переключить активного провайдера (deepseek, qwen)",
         "/model": "Переключить модель LLM",
@@ -56,6 +57,10 @@ class MultiProviderCommandCompleter(Completer):
     }
 
     SUBCOMMANDS = {
+        "/proxy": {
+            "start": "Запустить прокси-сервер и режим мониторинга агентов",
+            "status": "Показать статус и эндпоинты для подключения Cline / Cursor",
+        },
         "/login": {
             "deepseek": "Открыть браузер и войти в DeepSeek",
             "qwen": "Открыть браузер и войти в Qwen",
@@ -128,6 +133,8 @@ class MultiProviderCLI:
         self.search_enabled = False
         self.http_client: Optional[httpx.AsyncClient] = None
         self.session: Optional[PromptSession] = None
+        self._server_task: Optional[asyncio.Task] = None
+        self._uvicorn_server = None
 
     async def init(self):
         self.http_client = httpx.AsyncClient(
@@ -146,6 +153,8 @@ class MultiProviderCLI:
     async def close(self):
         if self.http_client:
             await self.http_client.aclose()
+        if self._uvicorn_server:
+            self._uvicorn_server.should_exit = True
 
     @property
     def is_thinking_enabled(self) -> bool:
@@ -170,7 +179,7 @@ class MultiProviderCLI:
         search_str = "🌐 Поиск: ВКЛ" if self.search_enabled else "🌐 Поиск: ВЫКЛ"
         sid = self.get_active_session_id()
         session_short = (sid[:8] + "...") if sid else "новая"
-        return f" [{prov_name}] | [Модель: {self.model}] | [{think_str}] | [{search_str}] | [Сессия: {session_short}] "
+        return f" [{prov_name}] | [Модель: {self.model}] | [{think_str}] | [{search_str}] | [Сессия: {session_short}] | [/proxy]"
 
     def print_banner(self):
         banner = """
@@ -215,6 +224,7 @@ class MultiProviderCLI:
     def print_help(self):
         help_text = """
 [bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
+  [bold yellow]/proxy[/bold yellow]                       - Перейти в режим Proxy-монитора (прослушка запросов от Cline/Roo)
   [bold yellow]/login [deepseek|qwen][/bold yellow]    - Автоматический вход через окно браузера (без ручного копирования)
   [bold yellow]/provider <deepseek|qwen>[/bold yellow] - Переключить активного провайдера
   [bold yellow]/model <name>[/bold yellow]              - Переключить модель (v4-pro, qwen3.7-plus, qwen-3.8-coder и др.)
@@ -229,6 +239,113 @@ class MultiProviderCLI:
   [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]            - Выйти из консоли
         """
         console.print(Panel(help_text, title="Справка", border_style="cyan"))
+
+    async def start_background_server(self):
+        """Запускает FastAPI Proxy сервер в фоне внутри текущего event loop."""
+        if hasattr(self, "_server_task") and self._server_task and not self._server_task.done():
+            return
+
+        import uvicorn
+        from app.main import app as fastapi_app
+
+        config = uvicorn.Config(
+            fastapi_app,
+            host=settings.HOST,
+            port=settings.PORT,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        self._uvicorn_server = server
+        self._server_task = asyncio.create_task(server.serve())
+        await asyncio.sleep(0.6)
+
+    async def enter_proxy_mode(self):
+        """Запускает интерактивный инспектор запросов от внешних AI-агентов (Cline, Cursor, Roo)."""
+        console.print(f"[cyan]Инициализация Proxy-сервера на порту {settings.PORT}...[/cyan]")
+        await self.start_background_server()
+
+        proxy_banner = f"""
+[bold cyan]╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                   🛡️ РЕЖИМ PROXY: МОНИТОРИНГ И ЛОГИРОВАНИЕ ЗАПРОСОВ АГЕНТОВ                     ║
+║                                                                                                ║
+║  • OpenAI Endpoint:    [bold yellow]http://127.0.0.1:{settings.PORT}/v1/chat/completions[/bold yellow]                               ║
+║  • Anthropic Endpoint: [bold yellow]http://127.0.0.1:{settings.PORT}/v1/messages[/bold yellow]                                      ║
+║  • API Key:            [bold green]любая строка (например, 'deepseek' или 'qwen')[/bold green]                        ║
+║                                                                                                ║
+║  [bold]Настройки подключения для Cline / Roo Code / Cursor:[/bold]                                      ║
+║    API Provider: [yellow]OpenAI Compatible[/yellow] или [yellow]Anthropic[/yellow]                                         ║
+║    Base URL:     [yellow]http://127.0.0.1:{settings.PORT}/v1[/yellow]                                                    ║
+║    Model ID:     [yellow]deepseek-v4-pro[/yellow] | [yellow]deepseek-reasoner[/yellow] | [yellow]qwen-3.8-coder[/yellow]                          ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════╝[/bold cyan]
+[bold green]● Proxy-сервер активен и слушает входящие запросы.[/bold green]
+[dim]Для возврата в режим интерактивного диалога нажмите [bold]Ctrl+C[/bold].[/dim]
+"""
+        console.print(proxy_banner)
+
+        from app.services.proxy_logger import proxy_logger
+        in_thinking = False
+
+        def on_event(event: dict):
+            nonlocal in_thinking
+            e_type = event.get("type")
+
+            if e_type == "request_start":
+                in_thinking = False
+                proto = event.get("protocol", "OpenAI")
+                ep = event.get("endpoint", "")
+                m = event.get("model", "")
+                p = event.get("provider", "")
+                toks = event.get("tokens", 0)
+                msgs = event.get("messages_count", 0)
+                tools = event.get("tools", [])
+                t_str = f" | Tools ({len(tools)}): {', '.join(tools[:5])}{'...' if len(tools)>5 else ''}" if tools else " | Tools: нет"
+                t_now = event.get("time", "")
+
+                console.print(f"\n[bold magenta]┌── 📥 [{t_now}] Входящий запрос от агента ({event.get('user_agent', 'Agent')}) ──────────────────────[/bold magenta]")
+                console.print(f"[bold magenta]│[/bold magenta] [bold cyan]Протокол:[/bold cyan] {proto} ({ep}) | [bold cyan]Модель:[/bold cyan] [yellow]{m}[/yellow] -> [green]{p}[/green]")
+                console.print(f"[bold magenta]│[/bold magenta] [dim]Контекст: {msgs} сообщений (~{toks:,} токенов){t_str}[/dim]")
+                console.print(f"[bold magenta]└── Потоковая генерация ответа ───────────────────────────────────────────────────────────[/bold magenta]")
+
+            elif e_type == "thinking_chunk":
+                if not in_thinking:
+                    sys.stdout.write("\n\033[90m🧠 Рассуждения: ")
+                    in_thinking = True
+                sys.stdout.write(event.get("text", ""))
+                sys.stdout.flush()
+
+            elif e_type == "content_chunk":
+                if in_thinking:
+                    sys.stdout.write("\033[0m\n\n")
+                    in_thinking = False
+                sys.stdout.write(event.get("text", ""))
+                sys.stdout.flush()
+
+            elif e_type == "tool_call":
+                fn_name = event.get("tool_name", "")
+                args = event.get("arguments", "")
+                console.print(f"\n[bold yellow]🛠️  [Вызов инструмента][/bold yellow] [bold cyan]{fn_name}[/bold cyan]([dim]{args[:120]}{'...' if len(args)>120 else ''}[/dim])")
+
+            elif e_type == "request_end":
+                if in_thinking:
+                    sys.stdout.write("\033[0m\n")
+                    in_thinking = False
+                status_code = event.get("status_code", 200)
+                toks_out = event.get("tokens_out", 0)
+                status_style = "bold green" if status_code == 200 else "bold red"
+                console.print(f"\n[{status_style}]✓ Запрос завершен [{status_code}][/] | Сгенерировано: [cyan]{toks_out}[/cyan] токенов | Сервер готов к следующим запросам...\n")
+
+        proxy_logger.subscribe(on_event)
+
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            proxy_logger.unsubscribe(on_event)
+            console.print("\n[yellow]Возврат в режим интерактивного чата.[/yellow]\n")
+            self.print_status()
 
     def set_provider_and_default_model(self, pid: str):
         pid = pid.lower().strip()
@@ -351,6 +468,8 @@ class MultiProviderCLI:
                     elif cmd == "/clear":
                         os.system("cls" if os.name == "nt" else "clear")
                         self.print_banner()
+                    elif cmd in ["/proxy", "/server"]:
+                        await self.enter_proxy_mode()
                     elif cmd == "/login":
                         target_p = arg.lower().strip() if arg else self.provider_id
                         if target_p not in ["deepseek", "qwen"]:
