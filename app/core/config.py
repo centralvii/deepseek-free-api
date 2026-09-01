@@ -18,13 +18,16 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
+    # Project paths
     PROJECT_ROOT: Path = BASE_DIR
     CREDENTIALS_PATH: Path = BASE_DIR / "credentials.json"
     USER_CREDENTIALS_PATH: Path = Path.home() / ".deepseek" / "credentials.json"
 
+    # DeepSeek Web API settings
     DEEPSEEK_BASE_URL: str = "https://chat.deepseek.com"
     DEEPSEEK_BEARER_TOKEN: str = Field(default="", description="Bearer token without 'Bearer ' prefix")
     
+    # Client emulation headers
     CLIENT_BUNDLE_ID: str = "com.deepseek.chat"
     CLIENT_VERSION: str = "2.4.0"
     CLIENT_LOCALE: str = "ru"
@@ -32,7 +35,14 @@ class Settings(BaseSettings):
     CLIENT_TIMEZONE_OFFSET: str = "10800"
     USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
     
+    # Request timeouts
     REQUEST_TIMEOUT: float = 180.0
+
+    # Long-Context & Compression Settings (1,000,000 token window -> 300,000 threshold)
+    MAX_CONTEXT_TOKENS: int = Field(default=300_000, description="Порог сжатия контекста (токенов)")
+    CONTEXT_COMPRESSION_ENABLED: bool = Field(default=True, description="Включить интеллектуальное сжатие контекста")
+    RETAIN_RECENT_MESSAGES_COUNT: int = Field(default=12, description="Количество последних сообщений без сжатия")
+    MAX_TOOL_OUTPUT_TOKENS: int = Field(default=25_000, description="Максимальный размер отдельного вывода инструмента")
 
 
 settings = Settings()
