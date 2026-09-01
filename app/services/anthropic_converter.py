@@ -14,6 +14,7 @@ from app.services.tool_parser import extract_tool_calls
 
 
 def build_anthropic_tools_prompt(tools: List[AnthropicTool]) -> str:
+    """Генерирует системную инструкцию инструментов из формата Anthropic."""
     tools_definitions = []
     for tool in tools:
         tools_definitions.append({
@@ -48,12 +49,20 @@ If no tool call is needed, provide your normal conversational response directly.
 
 
 def convert_anthropic_request_to_deepseek(request: AnthropicMessagesRequest) -> Tuple[DeepSeekChatRequest, bool]:
+    """
+    Конвертирует запрос Anthropic Messages API в DeepSeekChatRequest:
+    - Извлекает system prompt
+    - Распаковывает блоки content (text, image, tool_use, tool_result)
+    - Добавляет описания tools в нативном формате DeepSeek
+    """
     prompt_parts = []
 
+    # 1. Инструкция по инструментам
     has_tools = bool(request.tools)
     if request.tools:
         prompt_parts.append(build_anthropic_tools_prompt(request.tools))
 
+    # 2. Системный промпт (в Anthropic передается отдельно)
     if request.system:
         if isinstance(request.system, str):
             prompt_parts.append(f"System Instructions:\n{request.system.strip()}")
@@ -67,6 +76,7 @@ def convert_anthropic_request_to_deepseek(request: AnthropicMessagesRequest) -> 
             if sys_texts:
                 prompt_parts.append("System Instructions:\n" + "\n".join(sys_texts))
 
+    # 3. Сообщения диалога
     history_messages = []
     for msg in request.messages:
         role = msg.role
@@ -116,13 +126,14 @@ def convert_anthropic_request_to_deepseek(request: AnthropicMessagesRequest) -> 
 
     final_prompt = "\n\n".join(prompt_parts)
 
+    # Определяем, включен ли режим рассуждений в Anthropic
     thinking_enabled = None
     if request.thinking and request.thinking.type == "enabled":
         thinking_enabled = True
 
     deepseek_req = DeepSeekChatRequest(
         prompt=final_prompt,
-        chat_session_id=request.chat_session_id,
+        chat_session_id=request.chat_session_id or request.session_id,
         model=request.model,
         thinking_enabled=thinking_enabled,
         stream=request.stream,
@@ -136,8 +147,10 @@ def convert_deepseek_response_to_anthropic(
     model: str,
     has_tools: bool = False,
 ) -> AnthropicMessagesResponse:
+    """Преобразует синхронный ответ DeepSeek в AnthropicMessagesResponse."""
     content_blocks: List[AnthropicContentBlock] = []
 
+    # 1. Если есть рассуждения, добавляем блок thinking
     if resp.thinking:
         content_blocks.append(
             AnthropicContentBlock(
@@ -146,6 +159,7 @@ def convert_deepseek_response_to_anthropic(
             )
         )
 
+    # 2. Обрабатываем основной текст и вызовы инструментов
     clean_text = resp.content
     stop_reason = "end_turn"
 

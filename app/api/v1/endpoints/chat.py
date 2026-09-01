@@ -32,6 +32,10 @@ async def send_chat_message(
     request: DeepSeekChatRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
+    """
+    Отправляет запрос в выбранный LLM провайдер (DeepSeek, Qwen, GLM).
+    Поддерживает как стриминг (SSE), так и получение полного ответа сразу.
+    """
     provider = provider_registry.resolve_provider_for_model(request.model)
 
     if request.stream:
@@ -58,6 +62,14 @@ async def openai_chat_completions(
     request: OpenAIChatCompletionRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ):
+    """
+    Эндпоинт, на 100% совместимый с форматом OpenAI API (/v1/chat/completions).
+    Автоматически маршрутизирует модели:
+    - deepseek-v4-pro, deepseek-reasoner, deepseek-chat -> DeepSeek
+    - qwen-3.8, qwen-3.8-coder, qwen-3-max -> Qwen
+    - glm-5.3, glm-5-pro, glm-5-coder -> GLM
+    - Поддерживает Tool Use (Function Calling) и передачу reasoning_content
+    """
     if not request.messages:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -66,19 +78,22 @@ async def openai_chat_completions(
 
     provider = provider_registry.resolve_provider_for_model(request.model)
 
+    # 1. Форматируем все сообщения и инструменты в единый контекстный промпт
     compiled_prompt = format_messages_to_prompt(request.messages, request.tools)
 
     deepseek_req = DeepSeekChatRequest(
         prompt=compiled_prompt,
-        chat_session_id=request.chat_session_id,
+        chat_session_id=request.chat_session_id or request.session_id,
         model=request.model,
         stream=request.stream,
     )
 
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+    # 2. Потоковый режим (Streaming)
     if request.stream:
         async def sse_generator() -> AsyncGenerator[str, None]:
+            # Первое сообщение: объявление роли
             first_chunk = OpenAIChatCompletionChunk(
                 id=req_id,
                 model=request.model,
@@ -90,6 +105,7 @@ async def openai_chat_completions(
             has_tools = bool(request.tools)
 
             async for chunk in provider.stream_chat(deepseek_req):
+                # Мысли модели (DeepSeek-R1 / Qwen / GLM)
                 if chunk.type == "thinking":
                     c = OpenAIChatCompletionChunk(
                         id=req_id,
@@ -98,6 +114,7 @@ async def openai_chat_completions(
                     )
                     yield f"data: {c.model_dump_json()}\n\n"
 
+                # Основной ответ
                 elif chunk.type == "content":
                     accumulated_content.append(chunk.text)
                     if not has_tools:
@@ -108,6 +125,7 @@ async def openai_chat_completions(
                         )
                         yield f"data: {c.model_dump_json()}\n\n"
 
+            # Если были запрошены инструменты, проверяем сгенерированный текст на tool_calls
             finish_reason = "stop"
             full_text = "".join(accumulated_content)
 
@@ -125,7 +143,7 @@ async def openai_chat_completions(
                                 function=OpenAIDeltaToolCallFunction(
                                     name=tc.function.name,
                                     arguments=tc.function.arguments,
-                                ),
+                                 ),
                             )
                         )
                     c = OpenAIChatCompletionChunk(
@@ -142,6 +160,7 @@ async def openai_chat_completions(
                     )
                     yield f"data: {c.model_dump_json()}\n\n"
 
+            # Завершающий чанк
             final_chunk = OpenAIChatCompletionChunk(
                 id=req_id,
                 model=request.model,
@@ -160,6 +179,7 @@ async def openai_chat_completions(
             },
         )
 
+    # 3. Синхронный режим (Non-streaming)
     else:
         resp = await provider.send_message(deepseek_req)
 

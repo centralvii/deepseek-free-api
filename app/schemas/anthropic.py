@@ -45,6 +45,7 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     thinking: Optional[AnthropicThinkingConfig] = None
     chat_session_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class AnthropicUsage(BaseModel):
@@ -58,6 +59,6 @@ class AnthropicMessagesResponse(BaseModel):
     role: str = "assistant"
     model: str
     content: List[AnthropicContentBlock]
-    stop_reason: Optional[str] = "end_turn"
+    stop_reason: Optional[str] = "end_turn"  # "end_turn", "tool_use", "max_tokens"
     stop_sequence: Optional[str] = None
     usage: AnthropicUsage = Field(default_factory=AnthropicUsage)

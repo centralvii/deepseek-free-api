@@ -26,7 +26,7 @@ class OpenAIToolCall(BaseModel):
 
 
 class OpenAIChatMessage(BaseModel):
-    role: str
+    role: str  # "system", "user", "assistant", "tool", "function"
     content: Optional[Union[str, List[Dict[str, Any]]]] = ""
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
@@ -45,6 +45,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     functions: Optional[List[Dict[str, Any]]] = None
     function_call: Optional[Union[str, Dict[str, Any]]] = None
     chat_session_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class OpenAIChoiceMessage(BaseModel):
@@ -57,7 +58,7 @@ class OpenAIChoiceMessage(BaseModel):
 class OpenAIChoice(BaseModel):
     index: int = 0
     message: OpenAIChoiceMessage
-    finish_reason: Optional[str] = "stop"
+    finish_reason: Optional[str] = "stop"  # "stop", "tool_calls", "length"
 
 
 class OpenAIUsage(BaseModel):
@@ -74,6 +75,8 @@ class OpenAIChatCompletionResponse(BaseModel):
     choices: List[OpenAIChoice]
     usage: Optional[OpenAIUsage] = None
 
+
+# --- Streaming Chunks ---
 
 class OpenAIDeltaToolCallFunction(BaseModel):
     name: Optional[str] = None
