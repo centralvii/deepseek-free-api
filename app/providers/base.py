@@ -42,3 +42,19 @@ class BaseLLMProvider(ABC):
     ) -> DeepSeekChatResponse:
         """Синхронный вызов чата."""
         pass
+
+    def get_current_session_id(self) -> Optional[str]:
+        """Возвращает ID текущей активной сессии."""
+        return None
+
+    def set_session_id(self, session_id: str) -> None:
+        """Устанавливает текущую активную сессию."""
+        pass
+
+    def reset_session(self) -> None:
+        """Сбрасывает контекст текущей сессии."""
+        pass
+
+    async def list_sessions(self) -> List[dict]:
+        """Возвращает список доступных сессий/чатов."""
+        return []

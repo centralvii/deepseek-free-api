@@ -1,4 +1,4 @@
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 import httpx
 from app.core.credentials import credentials_manager
 from app.providers.base import BaseLLMProvider
@@ -23,6 +23,18 @@ class DeepSeekProvider(BaseLLMProvider):
 
     def is_authenticated(self) -> bool:
         return credentials_manager.is_authenticated("deepseek")
+
+    def get_current_session_id(self) -> Optional[str]:
+        from app.services.session_manager import session_manager
+        return session_manager.get_current_session_id()
+
+    def set_session_id(self, session_id: str) -> None:
+        from app.services.session_manager import session_manager
+        session_manager.set_current_session_id(session_id)
+
+    def reset_session(self) -> None:
+        from app.services.session_manager import session_manager
+        session_manager.reset_context()
 
     async def stream_chat(
         self,
