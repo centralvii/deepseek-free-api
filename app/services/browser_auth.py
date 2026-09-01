@@ -13,48 +13,61 @@ logger = logging.getLogger(__name__)
 async def extract_token_via_browser(
     provider: str = "deepseek",
     headless: bool = False,
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 180,
 ) -> Optional[str]:
     """
-    Открывает системный браузер (Chrome / Edge) с постоянным профилем,
+    Открывает системный браузер Google Chrome (или Edge),
     позволяет пользователю войти в аккаунт и автоматически перехватывает
     и сохраняет рабочий токен авторизации для DeepSeek или Qwen.
     """
     prov = provider.lower().strip()
-    profile_dir = os.path.abspath(f".browser_profile/{prov}")
+    profile_dir = os.path.abspath(".browser_profile")
     os.makedirs(profile_dir, exist_ok=True)
+    state_file = os.path.join(profile_dir, f"{prov}_state.json")
 
     target_url = "https://chat.deepseek.com" if prov == "deepseek" else "https://chat.qwen.ai"
     extracted_token = None
 
     async with async_playwright() as p:
-        # Пробуем запустить Google Chrome, иначе Microsoft Edge
-        context = None
-        for channel in ["chrome", "msedge"]:
+        browser = None
+        # Пробуем запустить Google Chrome
+        for ch in ["chrome", "msedge"]:
             try:
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
-                    channel=channel,
+                browser = await p.chromium.launch(
+                    channel=ch,
                     headless=headless,
-                    viewport={"width": 1280, "height": 850},
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--no-first-run",
                         "--no-default-browser-check",
                     ],
                 )
-                logger.info(f"Браузер ({channel}) успешно запущен для {prov}")
+                logger.info(f"Браузер ({ch}) успешно запущен.")
                 break
             except Exception as e:
-                logger.warning(f"Не удалось запустить канал '{channel}': {e}")
+                logger.debug(f"Канал {ch} недоступен: {e}")
 
-        if not context:
-            logger.error("Не удалось запустить ни Chrome, ни Edge.")
-            return None
+        if not browser:
+            try:
+                browser = await p.chromium.launch(headless=headless)
+            except Exception as e:
+                logger.error(f"Не удалось запустить браузер: {e}")
+                return None
 
-        page = context.pages[0] if context.pages else await context.new_page()
+        context_kwargs = {
+            "viewport": {"width": 1280, "height": 850},
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        }
+        if os.path.exists(state_file):
+            try:
+                context_kwargs["storage_state"] = state_file
+            except Exception:
+                pass
 
-        # 1. Перехват из сетевых запросов
+        context = await browser.new_context(**context_kwargs)
+        page = await context.new_page()
+
+        # 1. Перехват из исходящих сетевых запросов
         async def on_request(request):
             nonlocal extracted_token
             req_url = request.url
@@ -68,7 +81,7 @@ async def extract_token_via_browser(
                         extracted_token = tok
                         logger.info("Токен DeepSeek перехвачен из сетевого запроса!")
 
-            # Qwen Bearer токен или Cookie
+            # Qwen Bearer токен
             elif prov == "qwen":
                 if auth_hdr and "Bearer " in auth_hdr and "chat.qwen.ai" in req_url:
                     tok = auth_hdr.replace("Bearer ", "").strip()
@@ -90,7 +103,6 @@ async def extract_token_via_browser(
 
             try:
                 if prov == "deepseek":
-                    # Проверка localStorage userToken
                     ls_val = await page.evaluate("""() => {
                         try {
                             const raw = localStorage.getItem('userToken');
@@ -111,7 +123,7 @@ async def extract_token_via_browser(
                     cookie_parts = []
                     found_jwt = None
                     for c in cookies:
-                        if c["domain"] and "qwen.ai" in c["domain"]:
+                        if c.get("domain") and "qwen.ai" in c["domain"]:
                             cookie_parts.append(f"{c['name']}={c['value']}")
                             if c["name"] == "token" and len(c["value"]) > 30:
                                 found_jwt = c["value"]
@@ -126,8 +138,14 @@ async def extract_token_via_browser(
 
             await asyncio.sleep(1)
 
+        if extracted_token:
+            try:
+                await context.storage_state(path=state_file)
+            except Exception:
+                pass
+
         try:
-            await context.close()
+            await browser.close()
         except Exception:
             pass
 
@@ -142,9 +160,9 @@ async def extract_token_via_browser(
 if __name__ == "__main__":
     import sys
     prov_arg = sys.argv[1] if len(sys.argv) > 1 else "deepseek"
-    print(f"Запуск автологина для {prov_arg}...")
-    res = asyncio.run(extract_token_via_browser(provider=prov_arg, headless=False, timeout_seconds=90))
+    print(f"Запуск окна браузера для {prov_arg}...")
+    res = asyncio.run(extract_token_via_browser(provider=prov_arg, headless=False, timeout_seconds=120))
     if res:
         print(f"\n[УСПЕХ] Токен для {prov_arg} успешно получен и сохранен в credentials.json!")
     else:
-        print(f"\n[ОШИБКА] Не удалось получить токен. Попробуйте еще раз.")
+        print(f"\n[ОШИБКА] Не удалось получить токен.")
