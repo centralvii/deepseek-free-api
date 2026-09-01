@@ -95,8 +95,42 @@ class QwenProvider(BaseLLMProvider):
     def is_authenticated(self) -> bool:
         return credentials_manager.is_authenticated("qwen")
 
+    def get_current_session_id(self) -> Optional[str]:
+        return self._current_chat_id
+
+    def set_session_id(self, session_id: str) -> None:
+        self._current_chat_id = session_id
+
     def reset_session(self) -> None:
         self._current_chat_id = None
+
+    async def list_sessions(self) -> List[dict]:
+        """Возвращает список существующих чатов с сервера Qwen."""
+        token = credentials_manager.get_token("qwen")
+        if not token:
+            return []
+        headers = self._build_headers(token, "")
+        url = f"{self.base_url}/api/v2/chats"
+        try:
+            resp = await self.client.get(url, headers=headers, timeout=20.0)
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                items = data.get("data", [])
+                results = []
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict):
+                            results.append({
+                                "id": it.get("id"),
+                                "title": it.get("title") or "Без названия",
+                                "created_at": it.get("created_at"),
+                                "updated_at": it.get("updated_at"),
+                                "provider": "qwen"
+                            })
+                return results
+        except Exception as e:
+            logger.warning(f"Ошибка получения списка сессий Qwen: {e}")
+        return []
 
     def _resolve_qwen_model(self, requested_model: str) -> str:
         req_lower = requested_model.lower().strip()

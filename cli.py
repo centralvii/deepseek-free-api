@@ -36,6 +36,8 @@ prompt_style = Style.from_dict({
 
 
 class MultiProviderCommandCompleter(Completer):
+    """Динамическое автодополнение команд и моделей для всех провайдеров."""
+
     COMMANDS = {
         "/provider": "Переключить активного провайдера (deepseek, qwen, glm)",
         "/model": "Переключить модель LLM",
@@ -43,6 +45,8 @@ class MultiProviderCommandCompleter(Completer):
         "/think": "Режим рассуждений/мыслей (show / hide / off)",
         "/search": "Веб-поиск в реальном времени (on / off)",
         "/new": "Начать новый диалог (сбросить контекст)",
+        "/sessions": "Показать список предыдущих диалогов",
+        "/session": "Переключиться на диалог по его ID (например, /session <id>)",
         "/status": "Показать статус провайдеров, модель и ID сессии",
         "/clear": "Очистить экран терминала",
         "/help": "Показать список доступных команд",
@@ -67,18 +71,21 @@ class MultiProviderCommandCompleter(Completer):
             "off": "Выключить поиск",
         },
         "/model": {
+            # DeepSeek
             "deepseek-v4-pro": "[DeepSeek] 1.6T MoE (49B act) рассуждения и сложный код",
             "deepseek-v4-flash": "[DeepSeek] 284B MoE сверхбыстрый чат",
             "deepseek-v4-flash-vision-exp": "[DeepSeek] Мультимодальная модель",
             "deepseek-reasoner": "[DeepSeek] R1 модель пошаговых рассуждений",
             "deepseek-chat": "[DeepSeek] V3 универсальный чат",
             "deepseek-search": "[DeepSeek] V3 с веб-поиском",
+            # Qwen
             "qwen3.7-plus": "[Qwen] Актуальная веб-модель Qwen 3.7 Plus (Thinking)",
             "qwen-3.8": "[Qwen] Флагман 3-го поколения с рассуждениями",
             "qwen-3.8-coder": "[Qwen] Специализированная модель для сложного кодинга",
             "qwen-3-max": "[Qwen] Максимальная интеллектуальная мощность",
             "qwen-3-plus": "[Qwen] Быстрый универсальный ассистент",
             "qwen-3-flash": "[Qwen] Zero-Latency мгновенные ответы",
+            # GLM
             "glm-5.3": "[GLM] Новейший флагман 5.3 с глубоким пониманием",
             "glm-5-pro": "[GLM] Профессиональная модель рассуждений",
             "glm-5-coder": "[GLM] Специализированная модель для разработки и аудита",
@@ -120,7 +127,7 @@ class MultiProviderCLI:
     def __init__(self):
         self.provider_id = "deepseek"
         self.model = "deepseek-v4-pro"
-        self.thinking_mode = "show"
+        self.thinking_mode = "show"  # "show" | "hide" | "off"
         self.search_enabled = False
         self.http_client: Optional[httpx.AsyncClient] = None
         self.session: Optional[PromptSession] = None
@@ -205,11 +212,13 @@ class MultiProviderCLI:
         help_text = """
 [bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
   [bold yellow]/provider <deepseek|qwen|glm>[/bold yellow] - Переключить активного провайдера
-  [bold yellow]/model <name>[/bold yellow]                 - Переключить модель (v4-pro, qwen-3.8-coder, glm-5.3 и др.)
+  [bold yellow]/model <name>[/bold yellow]                 - Переключить модель (v4-pro, qwen3.7-plus, glm-5.3 и др.)
   [bold yellow]/token [provider] <token>[/bold yellow]     - Установить Bearer токен для провайдера
   [bold yellow]/think [show|hide|off][/bold yellow]      - Режим мыслей: показывать, скрывать или выключить
   [bold yellow]/search [on|off][/bold yellow]              - Включить/выключить поиск в интернете
   [bold yellow]/new[/bold yellow]                          - Начать новый чат (сбросить контекст диалога)
+  [bold yellow]/sessions[/bold yellow]                     - Список предыдущих сохраненных диалогов
+  [bold yellow]/session <ID>[/bold yellow]                 - Переключиться на существующий диалог
   [bold yellow]/status[/bold yellow]                       - Показать текущее состояние и статус токенов
   [bold yellow]/clear[/bold yellow]                        - Очистить экран терминала
   [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]               - Выйти из консоли
@@ -263,6 +272,7 @@ class MultiProviderCLI:
                 if chunk.token_usage:
                     tokens_count = chunk.token_usage
 
+                # Обработка блока рассуждений (Thinking)
                 if chunk.type == "thinking":
                     if self.thinking_mode == "show":
                         if not in_thinking:
@@ -277,6 +287,7 @@ class MultiProviderCLI:
                             sys.stdout.flush()
                             in_thinking = True
 
+                # Обработка основного ответа (Content)
                 elif chunk.type == "content":
                     if in_thinking:
                         if self.thinking_mode == "show":
@@ -365,6 +376,33 @@ class MultiProviderCLI:
                             pass
                         console.print("[green]✓ Начат новый диалог. Контекст сброшен.[/green]")
                         self.print_status()
+                    elif cmd == "/sessions":
+                        try:
+                            cur_p = provider_registry.get_provider(self.provider_id)
+                            sessions_list = await cur_p.list_sessions()
+                            if not sessions_list:
+                                console.print(f"[yellow]У провайдера {cur_p.display_name} нет сохраненных сессий или не удалось их получить.[/yellow]")
+                            else:
+                                console.print(f"\n[bold cyan]Список диалогов ({cur_p.display_name}):[/bold cyan]")
+                                for idx, s in enumerate(sessions_list[:15], 1):
+                                    s_id = s.get("id", "")
+                                    s_title = s.get("title", "Без названия")
+                                    is_curr = " [green](текущий)[/green]" if s_id == cur_p.get_current_session_id() else ""
+                                    console.print(f"  {idx}. [yellow]{s_id}[/yellow] — [bold]{s_title}[/bold]{is_curr}")
+                                console.print("[dim]Для переключения введите:[/dim] [bold yellow]/session <ID>[/bold yellow]\n")
+                        except Exception as e:
+                            console.print(f"[red]Ошибка при получении сессий:[/red] {e}")
+                    elif cmd == "/session":
+                        if not arg:
+                            console.print("[yellow]Использование:[/yellow] /session <ID_сессии>")
+                        else:
+                            try:
+                                cur_p = provider_registry.get_provider(self.provider_id)
+                                cur_p.set_session_id(arg)
+                                console.print(f"[green]✓ Переключено на сессию {arg} ({cur_p.display_name})[/green]")
+                                self.print_status()
+                            except Exception as e:
+                                console.print(f"[red]Ошибка переключения сессии:[/red] {e}")
                     elif cmd == "/think":
                         arg_lower = arg.lower()
                         if arg_lower in ["show", "on"]:
@@ -400,6 +438,7 @@ class MultiProviderCLI:
                         if not arg_clean:
                             console.print(f"[cyan]Текущая модель:[/cyan] {self.model}")
                         else:
+                            # Автоматически определяем провайдера для выбранной модели
                             target_provider = provider_registry.resolve_provider_for_model(arg_clean)
                             self.provider_id = target_provider.provider_id
                             self.model = arg_clean
