@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import time
 from typing import AsyncGenerator, List, Optional
 import uuid
 import httpx
@@ -33,6 +34,14 @@ QWEN_MODELS = [
         model_type="expert",
         supports_thinking=True,
         supports_search=False,
+    ),
+    ModelInfo(
+        id="qwen3.7-plus",
+        name="Qwen 3.7 Plus",
+        description="Актуальная веб-модель Qwen 3.7 Plus с режимом глубоких рассуждений (Thinking).",
+        model_type="expert",
+        supports_thinking=True,
+        supports_search=True,
     ),
     ModelInfo(
         id="qwen-3-max",
@@ -72,7 +81,7 @@ QWEN_MODELS = [
 class QwenProvider(BaseLLMProvider):
     """
     Провайдер для прямого веб-API chat.qwen.ai (/api/v2/chat/completions).
-    Полностью воспроизводит заголовки, куки и формат запросов реального веб-клиента.
+    На 100% повторяет реальный протокол v2.1, заголовки и JSON payload веб-клиента.
     """
 
     def __init__(self, http_client: httpx.AsyncClient):
@@ -89,12 +98,16 @@ class QwenProvider(BaseLLMProvider):
         req_lower = requested_model.lower().strip()
         if req_lower in ["qwen-3.8-coder", "3.8-coder", "qwen-coder", "coder"]:
             return "qwen-3.8-coder"
+        if req_lower in ["qwen3.7-plus", "3.7-plus", "qwen-3.7", "3.7"]:
+            return "qwen3.7-plus"
         if req_lower in ["qwen-3.8", "3.8", "qwen3"]:
             return "qwen-3.8"
         if req_lower in ["qwen-3-max", "max", "qwen-max"]:
             return "qwen-3-max"
         if req_lower in ["qwen-3-flash", "flash", "qwen-flash"]:
             return "qwen-3-flash"
+        if req_lower in ["qwen-3-plus", "plus"]:
+            return "qwen-3-plus"
         return requested_model
 
     def _build_headers(self, token_or_cookie: str, chat_id: str, thinking_enabled: bool) -> dict:
@@ -102,7 +115,6 @@ class QwenProvider(BaseLLMProvider):
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%a %b %d %Y %H:%M:%S GMT+0000")
         req_id = str(uuid.uuid4())
 
-        # Если передан полный заголовок Cookie
         if "token=" in token_or_cookie or "; " in token_or_cookie or "_bl_uid=" in token_or_cookie:
             cookie_header = token_or_cookie
             jwt_token = ""
@@ -145,6 +157,58 @@ class QwenProvider(BaseLLMProvider):
 
         return headers
 
+    def _build_payload(self, prompt: str, model: str, chat_id: str, thinking_enabled: bool, search_enabled: bool) -> dict:
+        """Формирует точный JSON payload протокола v2.1 chat.qwen.ai."""
+        now_ts = int(time.time())
+        fid = str(uuid.uuid4())
+        child_id = str(uuid.uuid4())
+        think_mode = "Thinking" if thinking_enabled else "Normal"
+
+        return {
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chatId": chat_id,
+            "parentId": "",
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": None,
+            "messages": [
+                {
+                    "id": None,
+                    "fid": fid,
+                    "parentId": None,
+                    "childrenIds": [child_id],
+                    "role": "user",
+                    "content": prompt,
+                    "user_action": "chat",
+                    "files": [],
+                    "timestamp": now_ts - 2,
+                    "models": [model],
+                    "model": "",
+                    "chat_type": "t2t",
+                    "feature_config": {
+                        "thinking_enabled": thinking_enabled,
+                        "output_schema": "phase",
+                        "research_mode": "normal",
+                        "auto_thinking": False,
+                        "thinking_mode": think_mode,
+                        "thinking_format": "summary",
+                        "auto_search": search_enabled,
+                    },
+                    "extra": {
+                        "meta": {
+                            "subChatType": "t2t"
+                        }
+                    },
+                    "sub_chat_type": "t2t",
+                    "parent_id": None,
+                }
+            ],
+            "timestamp": now_ts,
+        }
+
     async def stream_chat(
         self,
         request: DeepSeekChatRequest,
@@ -159,26 +223,10 @@ class QwenProvider(BaseLLMProvider):
         chat_id = request.chat_session_id or str(uuid.uuid4())
         resolved_model = self._resolve_qwen_model(request.model)
         thinking_enabled = request.thinking_enabled if request.thinking_enabled is not None else True
+        search_enabled = request.search_enabled if request.search_enabled is not None else False
 
         headers = self._build_headers(token, chat_id, thinking_enabled)
-
-        # Тело запроса к Qwen v2
-        payload = {
-            "stream": True,
-            "incremental": True,
-            "model": resolved_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": request.prompt,
-                    "chat_type": "t2t",
-                    "feature_config": {
-                        "thinking_enabled": thinking_enabled,
-                    }
-                }
-            ],
-            "parent_id": None,
-        }
+        payload = self._build_payload(request.prompt, resolved_model, chat_id, thinking_enabled, search_enabled)
 
         url = f"{self.base_url}/api/v2/chat/completions?chat_id={chat_id}"
 
@@ -206,20 +254,16 @@ class QwenProvider(BaseLLMProvider):
                         break
                     try:
                         data = json.loads(data_str)
-                        # 1. Формат choices (OpenAI/v2 style)
                         choices = data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
-                            # Блок рассуждений (thinking / reasoning_content / thought)
                             reasoning = delta.get("reasoning_content") or delta.get("thought") or delta.get("thinking")
                             if reasoning:
                                 yield StreamChunk(type="thinking", text=reasoning, session_id=chat_id)
-                            # Основной контент ответа
                             content = delta.get("content")
                             if content:
                                 yield StreamChunk(type="content", text=content, session_id=chat_id)
 
-                        # 2. Формат response / output (Qwen native v2)
                         elif "response" in data and isinstance(data["response"], dict):
                             resp_obj = data["response"]
                             if "thinking" in resp_obj and resp_obj["thinking"]:

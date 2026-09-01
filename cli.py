@@ -73,6 +73,7 @@ class MultiProviderCommandCompleter(Completer):
             "deepseek-reasoner": "[DeepSeek] R1 модель пошаговых рассуждений",
             "deepseek-chat": "[DeepSeek] V3 универсальный чат",
             "deepseek-search": "[DeepSeek] V3 с веб-поиском",
+            "qwen3.7-plus": "[Qwen] Актуальная веб-модель Qwen 3.7 Plus (Thinking)",
             "qwen-3.8": "[Qwen] Флагман 3-го поколения с рассуждениями",
             "qwen-3.8-coder": "[Qwen] Специализированная модель для сложного кодинга",
             "qwen-3-max": "[Qwen] Максимальная интеллектуальная мощность",
@@ -219,9 +220,9 @@ class MultiProviderCLI:
         pid = pid.lower().strip()
         if pid == "qwen":
             self.provider_id = "qwen"
-            self.model = "qwen-3.8-coder"
+            self.model = "qwen3.7-plus"
             provider_registry.set_default_provider("qwen")
-            console.print("[green]✓ Переключено на Qwen (по умолчанию модель qwen-3.8-coder)[/green]")
+            console.print("[green]✓ Переключено на Qwen (по умолчанию модель qwen3.7-plus)[/green]")
         elif pid == "glm":
             self.provider_id = "glm"
             self.model = "glm-5.3"
