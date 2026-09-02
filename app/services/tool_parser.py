@@ -90,7 +90,26 @@ Let me study the files to understand the project structure.
 FORBIDDEN BEHAVIOR (NEVER DO THIS):
 Assistant: "Let me study the remaining backend files and frontend structure." -> WRONG! Never stop without the `<tool_call>` block!
 
-6. If no tool call is needed and the entire task is complete, provide your normal conversational response directly.
+6. CRITICAL RULES FOR FILE EDITING / WRITING:
+When modifying or editing a file, ALWAYS invoke `Edit` or `Write` with valid JSON arguments!
+NEVER output raw code or file paths directly inside `<tool_call>` without the JSON structure:
+CORRECT:
+<tool_call>
+{{"name": "Edit", "arguments": {{"file_path": "path/to/file.py", "old_string": "exact old code", "new_string": "new code"}}}}
+</tool_call>
+or:
+<tool_call>
+{{"name": "Write", "arguments": {{"file_path": "path/to/file.py", "content": "full new content"}}}}
+</tool_call>
+
+FORBIDDEN (NEVER DO THIS):
+<tool_call>
+path/to/file.py
+# code...
+</tool_call>
+-> WRONG! This is invalid and causes errors. Always format as valid JSON.
+
+7. If no tool call is needed and the entire task is complete, provide your normal conversational response directly.
 """
     return prompt.strip()
 
@@ -322,6 +341,7 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     - Поддерживает markdown блоки ```tool_call...```.
     - Поддерживает нативный формат Qwen <function=name>...</function>.
     - Поддерживает многострочный код внутри аргументов (strict=False).
+    - Поддерживает неформатированные вызовы Edit/Write с путем к файлу и кодом.
     - Выполняет дедупликацию идентичных вызовов.
     Возвращает (очищенный_текст, список_tool_calls).
     """
@@ -528,5 +548,56 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
                 )
             )
         clean_text = clean_text.replace(block, "")
+
+    # 5. Проверка неформатированного вызова Edit/Write файла без JSON:
+    # <tool_call>\npath/to/file.py\ncode...\n</tool_call>
+    raw_file_call_pat = re.compile(
+        r'<tool_calls?[^>]*>\s*([a-zA-Z]:[\\/][^ \r\n\t]+|[a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)\s+([\s\S]+?)(?:</tool_calls?>|$)',
+        re.DOTALL
+    )
+    for match in raw_file_call_pat.finditer(clean_text):
+        fpath = match.group(1).strip()
+        code_body = match.group(2).strip()
+
+        # Пропускаем, если внутри уже есть валидный JSON
+        if '"name"' in code_body or '"arguments"' in code_body:
+            continue
+
+        old_str = ""
+        new_str = ""
+        is_edit = False
+
+        prefix_candidates = [code_body[:n] for n in [50, 40, 30, 25, 20] if len(code_body) > n * 2]
+        for p in prefix_candidates:
+            sec = code_body.find(p, len(p))
+            if sec != -1:
+                old_str = code_body[:sec].strip()
+                new_str = code_body[sec:].strip()
+                is_edit = True
+                break
+
+        if is_edit:
+            tool_name = "Edit"
+            args_obj = {"file_path": fpath, "old_string": old_str, "new_string": new_str}
+        else:
+            tool_name = "Write"
+            args_obj = {"file_path": fpath, "content": code_body}
+
+        args_str = json.dumps(args_obj, ensure_ascii=False)
+        call_key = (tool_name, args_str)
+        if call_key not in seen_calls:
+            seen_calls.add(call_key)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=call_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(name=tool_name, arguments=args_str),
+                )
+            )
+        clean_text = clean_text.replace(match.group(0), "")
+
+    # Окончательная подчистка оставшихся пустых тегов <tool_call>
+    clean_text = re.sub(r'</?tool_calls?[^>]*>', '', clean_text)
 
     return clean_text.strip(), tool_calls
