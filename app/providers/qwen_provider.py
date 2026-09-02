@@ -199,15 +199,8 @@ class QwenProvider(BaseLLMProvider):
 
         return headers
 
-    async def get_or_create_chat(self, chat_id: Optional[str] = None) -> str:
-        """Получает существующий chat_id или создает новую сессию через POST /api/v2/chats/new."""
-        if chat_id:
-            self._current_chat_id = chat_id
-            return chat_id
-
-        if self._current_chat_id:
-            return self._current_chat_id
-
+    async def _create_new_chat(self) -> str:
+        """Создает новую сессию через POST /api/v2/chats/new."""
         token = credentials_manager.get_token("qwen")
         if not token:
             raise HTTPException(
@@ -248,6 +241,19 @@ class QwenProvider(BaseLLMProvider):
         generated_id = str(uuid.uuid4())
         self._current_chat_id = generated_id
         return generated_id
+
+    async def get_or_create_chat(self, chat_id: Optional[str] = None) -> str:
+        """
+        Получает существующий chat_id или создает новую сессию через POST /api/v2/chats/new.
+        Если chat_id не указан (stateless запросы от внешних агентов ZCode/Cline),
+        всегда создается чистая новая сессия, предотвращающая переполнение контекста
+        и ошибку internal_error на серверах Alibaba.
+        """
+        if chat_id:
+            self._current_chat_id = chat_id
+            return chat_id
+
+        return await self._create_new_chat()
 
     def _build_payload(self, prompt: str, model: str, chat_id: str, thinking_enabled: bool, search_enabled: bool) -> dict:
         """Формирует точный JSON payload протокола v2.1 chat.qwen.ai."""
@@ -393,6 +399,7 @@ class QwenProvider(BaseLLMProvider):
                     if "error" in data or ("code" in data and data["code"] not in [200, "200", 0, "0"]):
                         err_msg = data.get("message") or data.get("error") or data.get("code")
                         logger.error(f"❌ Ошибка в SSE потоке Qwen: {data}")
+                        self.reset_session()
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=f"Qwen SSE error: {err_msg}"
