@@ -34,12 +34,12 @@ INTENT_PAT = re.compile(
     r'изучу|исследую|посмотрю|проверю|гляну|разберу|проанализирую|прочитаю|открою|найду|загляну|ознакомлюсь|выполню|запущу|начну|'
     r'давайте\s+(?:изучим|посмотрим|проверим|исследуем|откроем|глянем)|'
     r'нужно\s+(?:изучить|посмотреть|проверить|исследовать|открыть|понять)|'
-    r'let\s+me\s+(?:study|examine|investigate|analyze|review|search|scan|see|find|check|read|explore|inspect|run|look)|'
-    r'i\s*(?:will|\'ll|\s+need\s+to)\s+(?:study|examine|investigate|analyze|review|search|scan|see|find|check|read|explore|inspect|run|look|understand)|'
+    r'let\s+me\s+(?:study|examine|investigate|analyze|review|search|scan|see|find|check|read|explore|inspect|run|look|implement)|'
+    r'i\s*(?:will|\'ll|\s+need\s+to)\s+(?:study|examine|investigate|analyze|review|search|scan|see|find|check|read|explore|inspect|run|look|understand|implement)|'
     r'(?:next|first|now),?\s+(?:i\s+will|let\s+me)'
     r')'
     r'[^.!?\n]{0,120}'
-    r'(?:файл|код|проект|директори|папк|api|структур|конфиг|скрипт|репозитори|file|code|dir|repo|output|struct|backend|frontend|project|folder|plan)',
+    r'(?:файл|код|проект|директори|папк|api|структур|конфиг|скрипт|репозитори|file|code|dir|repo|output|struct|backend|frontend|project|folder|plan|service|parser)',
     re.IGNORECASE,
 )
 
@@ -193,17 +193,22 @@ async def openai_chat_completions(
                 if has_tools:
                     clean_text, tool_calls = extract_tool_calls(full_text)
 
+                    clean_prefix = re.split(r'<tool_calls?[^>]*>', full_text)[0].strip()
+
                     # Continuation Recovery: если модель заявила о намерении изучить файлы/выполнить код,
-                    # но оборвала генерацию до вызова инструмента, запрашиваем продолжение
-                    if not tool_calls and INTENT_PAT.search(full_text):
-                        logger.info("Обнаружено заявление намерения действия без вызова инструмента. Запуск Continuation Recovery...")
+                    # или выдала поврежденный/не-JSON тег tool_call, запрашиваем строгое продолжение в JSON
+                    if not tool_calls and (INTENT_PAT.search(full_text) or "<tool_call" in full_text):
+                        logger.info("Обнаружено заявление намерения действия или невалидный tool_call. Запуск Continuation Recovery...")
                         try:
+                            action_hint = clean_prefix[-150:] if len(clean_prefix) > 150 else clean_prefix
                             cont_req = DeepSeekChatRequest(
                                 prompt=(
                                     f"{deepseek_req.prompt}\n\n"
-                                    f"[Assistant response so far]\n{full_text}\n\n"
-                                    f"[System Instruction: Continue immediately and output the tool call for the action you just announced. "
-                                    f"Output valid JSON inside <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> now.]"
+                                    f"[Assistant response so far]\n{clean_prefix}\n\n"
+                                    f"[STRICT INSTRUCTION: Execute the tool call for \"{action_hint}\" immediately. "
+                                    f"Do NOT output raw code or file paths directly. "
+                                    f"Output valid JSON inside <tool_call>: "
+                                    f"<tool_call>\n{{\"name\": \"<function_name>\", \"arguments\": {{...}}}}\n</tool_call>]"
                                 ),
                                 chat_session_id=deepseek_req.chat_session_id,
                                 model=deepseek_req.model,
@@ -214,7 +219,7 @@ async def openai_chat_completions(
                             if cont_tools:
                                 tool_calls = cont_tools
                                 if cont_clean:
-                                    clean_text = (clean_text or full_text) + "\n" + cont_clean
+                                    clean_text = (clean_text or clean_prefix) + "\n" + cont_clean
                                 logger.info(f"✓ Continuation Recovery успешно извлек {len(cont_tools)} tool call(s)!")
                         except Exception as cont_err:
                             logger.warning(f"Ошибка Continuation Recovery: {cont_err}")
@@ -330,15 +335,20 @@ async def openai_chat_completions(
             if request.tools:
                 clean_text, found_tool_calls = extract_tool_calls(resp.content)
 
-                if not found_tool_calls and INTENT_PAT.search(resp.content):
-                    logger.info("Non-streaming: обнаружено намерение действия без вызова инструмента. Запуск Continuation Recovery...")
+                clean_prefix = re.split(r'<tool_calls?[^>]*>', resp.content)[0].strip()
+
+                if not found_tool_calls and (INTENT_PAT.search(resp.content) or "<tool_call" in resp.content):
+                    logger.info("Non-streaming: обнаружено намерение действия или невалидный tool_call. Запуск Continuation Recovery...")
                     try:
+                        action_hint = clean_prefix[-150:] if len(clean_prefix) > 150 else clean_prefix
                         cont_req = DeepSeekChatRequest(
                             prompt=(
                                 f"{deepseek_req.prompt}\n\n"
-                                f"[Assistant response so far]\n{resp.content}\n\n"
-                                f"[System Instruction: Continue immediately and output the tool call for the action you just announced. "
-                                f"Output valid JSON inside <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> now.]"
+                                f"[Assistant response so far]\n{clean_prefix}\n\n"
+                                f"[STRICT INSTRUCTION: Execute the tool call for \"{action_hint}\" immediately. "
+                                f"Do NOT output raw code or file paths directly. "
+                                f"Output valid JSON inside <tool_call>: "
+                                f"<tool_call>\n{{\"name\": \"<function_name>\", \"arguments\": {{...}}}}\n</tool_call>]"
                             ),
                             chat_session_id=deepseek_req.chat_session_id,
                             model=deepseek_req.model,
@@ -349,7 +359,7 @@ async def openai_chat_completions(
                         if cont_tools:
                             found_tool_calls = cont_tools
                             if cont_clean:
-                                clean_text = (clean_text or resp.content) + "\n" + cont_clean
+                                clean_text = (clean_text or clean_prefix) + "\n" + cont_clean
                             logger.info(f"✓ Non-streaming Continuation Recovery успешно извлек {len(cont_tools)} tool call(s)!")
                     except Exception as cont_err:
                         logger.warning(f"Ошибка Continuation Recovery: {cont_err}")

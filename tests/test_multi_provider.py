@@ -338,3 +338,36 @@ def test_intent_pattern_matching():
     assert INTENT_PAT.search(sample2) is not None
     assert INTENT_PAT.search(sample3) is None
     assert INTENT_PAT.search(sample4) is not None
+
+
+def test_raw_file_call_recovery():
+    """Тестирует авто-извлечение и конвертацию вызовов Edit/Write из неформатированного текста <tool_call> path code."""
+    import json
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """Now I have a complete picture. Let me improve the parser.
+
+<tool_call>
+
+E:\\vibecoding\\stepik-searcher\\backend\\app\\services\\stepik.py
+# 4. Fetch steps (tasks) in chunks
+tasks = []
+for i in range(0, len(step_ids), 100):
+    cost = s.get("worth", 0)
+
+# 4. Fetch steps (tasks) in chunks
+tasks = []
+for i in range(0, len(step_ids), 100):
+    cost = s.get("cost", s.get("worth", 0))
+    text_plain = _html_to_plain_text(text)
+"""
+
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 1
+    assert calls[0].function.name == "Edit"
+    args = json.loads(calls[0].function.arguments)
+    assert "stepik.py" in args["file_path"]
+    assert "s.get(\"worth\", 0)" in args["old_string"]
+    assert "s.get(\"cost\"" in args["new_string"]
+    assert "Now I have a complete picture" in clean_text
+    assert "<tool_call>" not in clean_text
