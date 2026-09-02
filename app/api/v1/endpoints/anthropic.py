@@ -46,10 +46,17 @@ async def anthropic_messages(
 
     provider = provider_registry.resolve_provider_for_model(request.model)
     deepseek_req, has_tools = convert_anthropic_request_to_deepseek(request)
-    msg_id = f"msg_{uuid.uuid4().hex[:20]}"
 
-    from app.services.context_compressor import estimate_tokens
+    from app.services.context_compressor import context_compressor, estimate_tokens
     from app.services.proxy_logger import proxy_logger
+
+    provider_token_limit = context_compressor.get_limit_for_provider(provider.provider_id)
+    if deepseek_req.prompt:
+        deepseek_req.prompt = context_compressor.compress_raw_prompt(
+            deepseek_req.prompt, max_tokens=provider_token_limit
+        )
+
+    msg_id = f"msg_{uuid.uuid4().hex[:20]}"
 
     tools_names = [t.name for t in (request.tools or [])]
     ua = raw_req.headers.get("user-agent", "Anthropic Client")
@@ -99,121 +106,57 @@ async def anthropic_messages(
                 return ""
 
             try:
-                try:
-                    async for chunk in active_provider.stream_chat(deepseek_req):
-                        ev = emit_start()
-                        if ev:
-                            yield ev
+                async for chunk in active_provider.stream_chat(deepseek_req):
+                    ev = emit_start()
+                    if ev:
+                        yield ev
 
-                        # Блок рассуждений (Thinking)
-                        if chunk.type == "thinking":
-                            proxy_logger.log_thinking_chunk(log_id, chunk.text)
-                            if not in_thinking_block:
+                    # Блок рассуждений (Thinking)
+                    if chunk.type == "thinking":
+                        proxy_logger.log_thinking_chunk(log_id, chunk.text)
+                        if not in_thinking_block:
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+                            in_thinking_block = True
+
+                        cb_delta = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "thinking_delta", "thinking": chunk.text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+
+                    # Блок текста ответа (Content)
+                    elif chunk.type == "content":
+                        proxy_logger.log_content_chunk(log_id, chunk.text)
+                        if in_thinking_block:
+                            cb_stop = {"type": "content_block_stop", "index": block_index}
+                            yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                            in_thinking_block = False
+                            block_index += 1
+
+                        accumulated_content.append(chunk.text)
+
+                        if not has_tools:
+                            if not in_text_block:
                                 cb_start = {
                                     "type": "content_block_start",
                                     "index": block_index,
-                                    "content_block": {"type": "thinking", "thinking": ""},
+                                    "content_block": {"type": "text", "text": ""},
                                 }
                                 yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                                in_thinking_block = True
+                                in_text_block = True
 
                             cb_delta = {
                                 "type": "content_block_delta",
                                 "index": block_index,
-                                "delta": {"type": "thinking_delta", "thinking": chunk.text},
+                                "delta": {"type": "text_delta", "text": chunk.text},
                             }
                             yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-
-                        # Блок текста ответа (Content)
-                        elif chunk.type == "content":
-                            proxy_logger.log_content_chunk(log_id, chunk.text)
-                            if in_thinking_block:
-                                cb_stop = {"type": "content_block_stop", "index": block_index}
-                                yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                                in_thinking_block = False
-                                block_index += 1
-
-                            accumulated_content.append(chunk.text)
-
-                            if not has_tools:
-                                if not in_text_block:
-                                    cb_start = {
-                                        "type": "content_block_start",
-                                        "index": block_index,
-                                        "content_block": {"type": "text", "text": ""},
-                                    }
-                                    yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                                    in_text_block = True
-
-                                cb_delta = {
-                                    "type": "content_block_delta",
-                                    "index": block_index,
-                                    "delta": {"type": "text_delta", "text": chunk.text},
-                                }
-                                yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-
-                except Exception as stream_err:
-                    if active_provider.provider_id == "qwen" and not message_started:
-                        ds_provider = provider_registry.get_provider("deepseek")
-                        if ds_provider and ds_provider.is_authenticated():
-                            logger.warning(
-                                f"⚠️ Qwen API отклонил запрос ({stream_err}). "
-                                f"Автоматическое переключение на DeepSeek V4..."
-                            )
-                            deepseek_req.model = "deepseek-v4-pro"
-                            async for chunk in ds_provider.stream_chat(deepseek_req):
-                                ev = emit_start()
-                                if ev:
-                                    yield ev
-
-                                if chunk.type == "thinking":
-                                    proxy_logger.log_thinking_chunk(log_id, chunk.text)
-                                    if not in_thinking_block:
-                                        cb_start = {
-                                            "type": "content_block_start",
-                                            "index": block_index,
-                                            "content_block": {"type": "thinking", "thinking": ""},
-                                        }
-                                        yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                                        in_thinking_block = True
-
-                                    cb_delta = {
-                                        "type": "content_block_delta",
-                                        "index": block_index,
-                                        "delta": {"type": "thinking_delta", "thinking": chunk.text},
-                                    }
-                                    yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-
-                                elif chunk.type == "content":
-                                    proxy_logger.log_content_chunk(log_id, chunk.text)
-                                    if in_thinking_block:
-                                        cb_stop = {"type": "content_block_stop", "index": block_index}
-                                        yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                                        in_thinking_block = False
-                                        block_index += 1
-
-                                    accumulated_content.append(chunk.text)
-
-                                    if not has_tools:
-                                        if not in_text_block:
-                                            cb_start = {
-                                                "type": "content_block_start",
-                                                "index": block_index,
-                                                "content_block": {"type": "text", "text": ""},
-                                            }
-                                            yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                                            in_text_block = True
-
-                                        cb_delta = {
-                                            "type": "content_block_delta",
-                                            "index": block_index,
-                                            "delta": {"type": "text_delta", "text": chunk.text},
-                                        }
-                                        yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-                        else:
-                            raise stream_err
-                    else:
-                        raise stream_err
 
                 if in_thinking_block:
                     cb_stop = {"type": "content_block_stop", "index": block_index}
@@ -336,22 +279,7 @@ async def anthropic_messages(
     # --- 2. Синхронный режим (Non-streaming) ---
     else:
         try:
-            try:
-                resp = await provider.send_message(deepseek_req)
-            except Exception as send_err:
-                if provider.provider_id == "qwen":
-                    ds_provider = provider_registry.get_provider("deepseek")
-                    if ds_provider and ds_provider.is_authenticated():
-                        logger.warning(
-                            f"⚠️ Qwen API отклонил запрос ({send_err}). "
-                            f"Автоматическое переключение на DeepSeek V4..."
-                        )
-                        deepseek_req.model = "deepseek-v4-pro"
-                        resp = await ds_provider.send_message(deepseek_req)
-                    else:
-                        raise send_err
-                else:
-                    raise send_err
+            resp = await provider.send_message(deepseek_req)
 
             result = convert_deepseek_response_to_anthropic(resp, model=request.model, has_tools=has_tools)
             proxy_logger.log_request_end(log_id, status_code=200, tokens_out=resp.token_usage or 0)

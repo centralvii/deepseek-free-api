@@ -312,7 +312,9 @@ class QwenProvider(BaseLLMProvider):
 
         from app.services.context_compressor import context_compressor, estimate_tokens
         if request.prompt:
-            request.prompt = context_compressor.compress_raw_prompt(request.prompt)
+            request.prompt = context_compressor.compress_raw_prompt(
+                request.prompt, max_tokens=context_compressor.QWEN_MAX_WEB_TOKENS
+            )
 
         chat_id = await self.get_or_create_chat(request.chat_session_id)
         resolved_model = self._resolve_qwen_model(request.model)
