@@ -110,43 +110,70 @@ def format_messages_to_prompt(
     return full_prompt
 
 
-def _parse_tool_json(raw_json: str) -> Optional[Tuple[str, str]]:
-    """Пытается распарсить JSON вызова инструмента с обработкой переносов строк в коде."""
+def _parse_all_tool_json(raw_json: str) -> List[Tuple[str, str]]:
+    """Парсит все JSON-объекты (один или несколько параллельных) из блока tool_call."""
+    results: List[Tuple[str, str]] = []
     if not raw_json:
-        return None
-    raw = raw_json.strip()
+        return results
 
-    # 1. Первая попытка: стандартный json.loads с strict=False (разрешает unescaped newlines/tabs в коде)
-    try:
-        data = json.loads(raw, strict=False)
-        if isinstance(data, dict):
-            name = data.get("name") or data.get("function")
-            args = data.get("arguments") or data.get("parameters") or data.get("input", {})
-            if name:
-                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-                return str(name).strip(), args_str
-    except Exception:
-        pass
+    s = raw_json.strip()
+    decoder = json.JSONDecoder(strict=False)
+    idx = 0
+    while idx < len(s):
+        while idx < len(s) and s[idx].isspace():
+            idx += 1
+        if idx >= len(s):
+            break
+        try:
+            obj, end_idx = decoder.raw_decode(s, idx)
+            if isinstance(obj, dict):
+                name = obj.get("name") or obj.get("function")
+                args = obj.get("arguments") or obj.get("parameters") or obj.get("input", {})
+                if name:
+                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                    results.append((str(name).strip(), args_str))
+            idx = end_idx
+        except Exception:
+            next_brace = s.find('{', idx + 1)
+            if next_brace != -1:
+                idx = next_brace
+            else:
+                break
 
-    # 2. Вторая попытка: экранируем сырые символы перевода строк
-    try:
-        sanitized = re.sub(r'[\r\n]+', '\\n', raw)
-        data = json.loads(sanitized, strict=False)
-        if isinstance(data, dict):
-            name = data.get("name") or data.get("function")
-            args = data.get("arguments") or data.get("parameters") or data.get("input", {})
-            if name:
-                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-                return str(name).strip(), args_str
-    except Exception:
-        pass
+    # Fallback 1: стандартный json.loads
+    if not results:
+        try:
+            data = json.loads(s, strict=False)
+            if isinstance(data, dict):
+                name = data.get("name") or data.get("function")
+                args = data.get("arguments") or data.get("parameters") or data.get("input", {})
+                if name:
+                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                    results.append((str(name).strip(), args_str))
+        except Exception:
+            pass
 
-    return None
+    # Fallback 2: экранируем сырые переносы строк
+    if not results:
+        try:
+            sanitized = re.sub(r'[\r\n]+', '\\n', s)
+            data = json.loads(sanitized, strict=False)
+            if isinstance(data, dict):
+                name = data.get("name") or data.get("function")
+                args = data.get("arguments") or data.get("parameters") or data.get("input", {})
+                if name:
+                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                    results.append((str(name).strip(), args_str))
+        except Exception:
+            pass
+
+    return results
 
 
 def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     """
     Извлекает вызовы инструментов из ответа модели:
+    - Поддерживает один или несколько JSON-объектов внутри одного тега <tool_call>...</tool_call>.
     - Поддерживает теги <tool_call>...</tool_call> (включая <tool_call"> и с атрибутами).
     - Поддерживает markdown блоки ```tool_call...```.
     - Поддерживает нативный формат Qwen <function=name>...</function>.
@@ -167,9 +194,8 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     for pat in patterns:
         for match in re.finditer(pat, text, re.DOTALL):
             raw_content = match.group(1)
-            parsed = _parse_tool_json(raw_content)
-            if parsed:
-                name, args_str = parsed
+            parsed_list = _parse_all_tool_json(raw_content)
+            for name, args_str in parsed_list:
                 call_key = (name, args_str)
                 if call_key not in seen_calls:
                     seen_calls.add(call_key)

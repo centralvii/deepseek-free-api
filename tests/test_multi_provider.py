@@ -161,3 +161,24 @@ def test_robust_tool_call_extraction():
     assert "main.py" in calls[1].function.arguments
     assert "<tool_call" not in clean_text
     assert "<function=" not in clean_text
+
+
+def test_multiple_json_in_single_tool_call_tag():
+    """Тестирует парсинг нескольких JSON объектов внутри одного тега <tool_call> (как возвращает Qwen)."""
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """Изучу структуру проекта и текущий парсер курсов.
+
+<tool_call>
+{"name": "Bash", "arguments": {"command": "find \\"E:/vibecoding/stepik-searcher\\" -type f | head -80", "description": "List project files"}}
+{"name": "Bash", "arguments": {"command": "ls -la \\"E:/vibecoding/stepik-searcher\\"", "description": "List root directory"}}
+</tool_call>"""
+
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 2
+    assert calls[0].function.name == "Bash"
+    assert "find" in calls[0].function.arguments
+    assert calls[1].function.name == "Bash"
+    assert "ls -la" in calls[1].function.arguments
+    assert clean_text == "Изучу структуру проекта и текущий парсер курсов."
+    assert "<tool_call>" not in clean_text
