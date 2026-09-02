@@ -62,3 +62,29 @@ def test_compress_raw_prompt():
     assert "Интеллектуальное сжатие контекста" in compressed
     assert "Header instructions" in compressed
     assert "Final task" in compressed
+
+
+def test_compress_raw_prompt_preserves_tools_and_instructions():
+    """Проверяет, что при сжатии промпта с историей диалога блок инструментов и инструкции остаются нетронутыми."""
+    compressor = ContextCompressor()
+
+    tools_block = "# Available Tools\n```json\n" + ("x" * 20_000) + "\n```\n\n# Tool Call Instructions\nCRITICAL REQUIREMENT: invoke tool using <tool_call>.\n"
+    sys_block = "System Instructions:\nYou are ZCode assistant.\n"
+    history_block = "\nConversation History:\nUser: Help me\nAssistant: Sure\n" + ("Long message with large file contents and logs " * 2000)
+
+    full_prompt = tools_block + "\n\n" + sys_block + history_block
+
+    compressed = compressor.compress_raw_prompt(full_prompt, max_tokens=20_000, max_bytes=70_000)
+
+    # 1. Инструкции по вызову инструментов полностью сохранены
+    assert "# Tool Call Instructions" in compressed
+    assert "CRITICAL REQUIREMENT: invoke tool using <tool_call>." in compressed
+    assert "```\n\n# Tool Call Instructions" in compressed
+    assert "System Instructions:\nYou are ZCode assistant." in compressed
+
+    # 2. Сжатие произошло только внутри истории
+    assert "Conversation History:" in compressed
+    assert "⚡ Интеллектуальное сжатие контекста" in compressed
+
+    # 3. Итоговый размер безопасен для веб-WAF Qwen (< 70 KB)
+    assert len(compressed.encode("utf-8")) <= 70_000

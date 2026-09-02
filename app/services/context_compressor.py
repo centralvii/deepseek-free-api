@@ -187,10 +187,39 @@ class ContextCompressor:
         # Вычисляем целевой размер в символах с учетом байтовой плотности кодировки (UTF-8)
         bytes_per_char = max(1.0, prompt_bytes / max(1, len(prompt)))
         if effective_max_bytes and prompt_bytes > effective_max_bytes:
-            target_char_len = int((effective_max_bytes - 600) / bytes_per_char)
+            target_char_len = int((effective_max_bytes - 800) / bytes_per_char)
         else:
             target_char_len = int(limit * 3.0 / bytes_per_char)
 
+        # 1. Приоритетное сжатие истории: если в промпте есть блок истории диалога,
+        # системные инструкции и блок доступных инструментов (# Available Tools / # Tool Call Instructions)
+        # сохраняются ПОЛНОСТЬЮ без обрезки!
+        for marker in ["\nConversation History:\n", "\n\nConversation History:\n", "Conversation History:\n"]:
+            if marker in prompt:
+                header, history = prompt.split(marker, 1)
+                header_with_marker = header + marker
+                header_bytes = len(header_with_marker.encode("utf-8"))
+                remaining_bytes = (effective_max_bytes - 800) - header_bytes if effective_max_bytes else (target_char_len - len(header_with_marker))
+
+                # Если под историю остается разумный бюджет (> 3000 байт/символов)
+                if remaining_bytes > 3000:
+                    h_bytes_per_char = max(1.0, len(history.encode("utf-8")) / max(1, len(history)))
+                    h_target_chars = int(remaining_bytes / h_bytes_per_char)
+                    if len(history) > h_target_chars:
+                        h_head_chars = int(h_target_chars * 0.20)
+                        h_tail_chars = int(h_target_chars * 0.75)
+                        h_head = history[:h_head_chars]
+                        h_tail = history[-h_tail_chars:]
+                        omitted = len(history) - (h_head_chars + h_tail_chars)
+                        omitted_tokens = int(omitted / 3.2)
+                        return (
+                            f"{header_with_marker}{h_head}\n\n"
+                            f"[... ⚡ Интеллектуальное сжатие контекста: сжато {omitted:,} символов (~{omitted_tokens:,} токенов) "
+                            f"промежуточных логов и истории для удержания фокуса модели в пределах {limit:,} токенов ...]\n\n"
+                            f"{h_tail}"
+                        )
+
+        # 2. Общий fallback для произвольного сырого текста без маркеров истории
         head_chars = int(target_char_len * 0.35)
         tail_chars = int(target_char_len * 0.55)
 
