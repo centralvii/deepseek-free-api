@@ -330,8 +330,8 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     clean_text = text
 
     # 0. Проверка формата DeepSeek DSML: <｜DSML｜tool_calls>...<｜DSML｜invoke name="...">...</｜DSML｜invoke>...</｜DSML｜tool_calls>
-    dsml_invoke_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*invoke\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\\s*(.*?)\\s*</[｜\|]*\s*DSML\s*[｜\|]*invoke>"
-    dsml_param_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*parameter\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\\s*(.*?)\\s*</[｜\|]*\s*DSML\s*[｜\|]*parameter>"
+    dsml_invoke_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*invoke\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*invoke>"
+    dsml_param_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*parameter\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*parameter>"
 
     for match in re.finditer(dsml_invoke_pat, text, re.DOTALL):
         name = match.group(1).strip()
