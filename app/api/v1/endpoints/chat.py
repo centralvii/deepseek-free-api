@@ -123,6 +123,9 @@ async def openai_chat_completions(
 
             try:
                 async for chunk in active_provider.stream_chat(deepseek_req):
+                    if chunk.type == "error":
+                        raise HTTPException(status_code=400, detail=chunk.text)
+
                     if not first_chunk_sent and chunk.type in ["thinking", "content"]:
                         first_chunk = OpenAIChatCompletionChunk(
                             id=req_id,
@@ -275,9 +278,5 @@ async def openai_chat_completions(
                 ),
             )
         except Exception as e:
-            try:
-                provider.reset_session()
-            except Exception:
-                pass
             proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
             raise

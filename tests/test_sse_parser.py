@@ -131,3 +131,28 @@ async def test_sse_parser_real_deepseek_dump():
     ct = "".join(content)
     assert "Мы должны" in th
     assert ct == "4"
+
+
+@pytest.mark.asyncio
+async def test_sse_parser_hint_error():
+    """Тестирует распознавание серверных ошибок DeepSeek в событии hint."""
+    lines = [
+        'event: ready',
+        'data: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}',
+        'event: hint',
+        'data: {"type":"error","content":"Вы ввели слишком длинный текст. Сократите его.","clear_response":true,"finish_reason":"input_exceeds_limit"}',
+        'event: close',
+        'data: {"click_behavior":"none","auto_resume":false}',
+    ]
+
+    async def gen_lines():
+        for l in lines:
+            yield l
+
+    chunks = []
+    async for chunk in parse_sse_lines(gen_lines(), session_id="test-session"):
+        chunks.append(chunk)
+
+    error_chunks = [c for c in chunks if c.type == "error"]
+    assert len(error_chunks) == 1
+    assert "input_exceeds_limit" in error_chunks[0].text or "слишком длинный" in error_chunks[0].text

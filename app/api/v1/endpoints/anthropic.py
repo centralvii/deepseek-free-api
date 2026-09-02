@@ -107,6 +107,9 @@ async def anthropic_messages(
 
             try:
                 async for chunk in active_provider.stream_chat(deepseek_req):
+                    if chunk.type == "error":
+                        raise HTTPException(status_code=400, detail=chunk.text)
+
                     ev = emit_start()
                     if ev:
                         yield ev

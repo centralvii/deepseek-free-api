@@ -65,7 +65,7 @@ def truncate_tool_output(content: str, max_tokens: int = 25_000) -> str:
 class ContextCompressor:
     """
     Интеллектуальный менеджер сжатия контекста:
-    - Следит за лимитом токенов провайдеров.
+    - Следит за лимитом ~300,000 токенов (из окна в 1,000,000).
     - Гарантированно сохраняет системные инструкции и tools.
     - Гарантированно сохраняет последние N сообщений диалога с полной детализацией.
     - Сжимает / уплотняет старую середину диалога и гигантские выводы инструментов.
@@ -73,8 +73,9 @@ class ContextCompressor:
 
     QWEN_MAX_WEB_TOKENS: int = 20_000
     QWEN_MAX_PAYLOAD_BYTES: int = 70_000
-    DEEPSEEK_MAX_WEB_TOKENS: int = 50_000
-    DEFAULT_MAX_TOKENS: int = 50_000
+    DEEPSEEK_MAX_WEB_TOKENS: int = 32_000
+    DEEPSEEK_MAX_PAYLOAD_BYTES: int = 140_000
+    DEFAULT_MAX_TOKENS: int = 32_000
 
     def __init__(
         self,
@@ -82,7 +83,7 @@ class ContextCompressor:
         retain_recent_count: Optional[int] = None,
         max_tool_tokens: Optional[int] = None,
     ):
-        self.max_context_tokens = max_context_tokens or getattr(settings, "MAX_CONTEXT_TOKENS", 50_000)
+        self.max_context_tokens = max_context_tokens or getattr(settings, "MAX_CONTEXT_TOKENS", 32_000)
         self.retain_recent_count = retain_recent_count or getattr(settings, "RETAIN_RECENT_MESSAGES_COUNT", 12)
         self.max_tool_tokens = max_tool_tokens or getattr(settings, "MAX_TOOL_OUTPUT_TOKENS", 25_000)
 
@@ -125,83 +126,128 @@ class ContextCompressor:
         if total_tokens <= limit:
             return sanitized_messages
 
-        # 3. Разделяем на: Системные + Старая история + Свежие сообщения (неприкосновенные)
+        logger.info(
+            f"Контекст диалога ({total_tokens:,} токенов) превысил порог {limit:,}. "
+            f"Запуск интеллектуального сжатия..."
+        )
+
+        # 3. Разделяем на системные, старую середину и свежие сообщения
         system_msgs = [m for m in sanitized_messages if m.role == "system"]
-        non_system = [m for m in sanitized_messages if m.role != "system"]
+        non_system_msgs = [m for m in sanitized_messages if m.role != "system"]
 
-        recent_count = min(self.retain_recent_count, len(non_system))
-        middle_msgs = non_system[:-recent_count] if recent_count > 0 else []
-        recent_msgs = non_system[-recent_count:] if recent_count > 0 else non_system
+        if len(non_system_msgs) <= self.retain_recent_count:
+            # Слишком мало сообщений для разделения, просто возвращаем
+            return sanitized_messages
 
-        # 4. Если всё еще превышает лимит, агрессивно сжимаем старые сообщения из middle
-        budget_for_middle = limit - sum(estimate_tokens(m.content or "") for m in system_msgs + recent_msgs)
-        if budget_for_middle <= 0:
-            # Бюджет исчерпан свежими сообщениями, оставляем только их + системные
-            return system_msgs + recent_msgs
+        recent_msgs = non_system_msgs[-self.retain_recent_count:]
+        middle_msgs = non_system_msgs[:-self.retain_recent_count]
 
-        compressed_middle: List[OpenAIChatMessage] = []
-        middle_tokens = 0
-        # Идем с конца middle_msgs (наиболее свежие из старых)
-        for msg in reversed(middle_msgs):
-            t = estimate_tokens(msg.content or "")
-            if middle_tokens + t <= budget_for_middle:
-                compressed_middle.append(msg)
-                middle_tokens += t
-            else:
-                # Если сообщение слишком велико, сжимаем его
-                remaining = budget_for_middle - middle_tokens
-                if remaining > 200 and isinstance(msg.content, str):
-                    shortened = truncate_tool_output(msg.content, max_tokens=remaining)
-                    msg_dict = msg.model_dump()
-                    msg_dict["content"] = shortened
-                    compressed_middle.append(OpenAIChatMessage(**msg_dict))
-                break
+        # 4. Формируем сжатую сводку старой середины диалога
+        summary_lines = []
+        for m in middle_msgs:
+            role = m.role
+            c = str(m.content or "")
+            if len(c) > 300:
+                c = c[:280] + "..."
+            summary_lines.append(f"- [{role}]: {c}")
 
-        compressed_middle.reverse()
-        return system_msgs + compressed_middle + recent_msgs
+        summary_text = (
+            f"[Сводка предыдущего контекста диалога ({len(middle_msgs)} ранних сообщений сжато для оптимизации памяти)]:\n"
+            + "\n".join(summary_lines)
+        )
 
-    def compress_raw_prompt(self, prompt: str, max_tokens: Optional[int] = None) -> str:
-        """
-        Сжимает сырую строку промпта, если она превышает заданный лимит.
-        ВАЖНО: Заголовок промпта (# Available Tools, # Tool Call Instructions, System Instructions)
-        НЕЛЬЗЯ обрезать, иначе модель теряет правила вызова инструментов.
-        Сжатие применяется строго к блоку 'Conversation History:'.
-        """
-        limit = max_tokens or self.max_context_tokens
-        current_tokens = estimate_tokens(prompt)
-        if current_tokens <= limit:
+        summary_msg = OpenAIChatMessage(
+            role="system",
+            content=summary_text,
+        )
+
+        result = system_msgs + [summary_msg] + recent_msgs
+        new_tokens = sum(estimate_tokens(m.content or "") for m in result)
+        logger.info(f"✓ Контекст успешно сжат: с {total_tokens:,} до {new_tokens:,} токенов.")
+        return result
+
+    def compress_raw_prompt(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+    ) -> str:
+        """Сжимает текстовый промпт по токенам и байтам UTF-8 для безопасного прохождения веб-WAF."""
+        if not prompt:
             return prompt
 
-        history_marker = "\n\nConversation History:\n"
-        if history_marker in prompt:
-            header, history = prompt.split(history_marker, 1)
-            header_tokens = estimate_tokens(header)
-            available_for_history = max(1_000, limit - header_tokens)
+        limit = max_tokens or self.max_context_tokens
+        curr_tokens = estimate_tokens(prompt)
+        prompt_bytes = len(prompt.encode("utf-8"))
+        if max_bytes:
+            effective_max_bytes = max_bytes
+        elif limit <= self.QWEN_MAX_WEB_TOKENS:
+            effective_max_bytes = self.QWEN_MAX_PAYLOAD_BYTES
+        else:
+            effective_max_bytes = self.DEEPSEEK_MAX_PAYLOAD_BYTES
 
-            # Если история превышает доступный лимит, сжимаем ее середину
-            history_tokens = estimate_tokens(history)
-            if history_tokens > available_for_history:
-                # Оставляем 20% начала истории и 70% самого конца (самые актуальные шаги)
-                ratio = available_for_history / history_tokens
-                keep_head_chars = int(len(history) * ratio * 0.20)
-                keep_tail_chars = int(len(history) * ratio * 0.70)
+        if curr_tokens <= limit and prompt_bytes <= effective_max_bytes:
+            return prompt
 
-                cut_history = (
-                    f"{history[:keep_head_chars]}\n\n"
-                    f"[... ⚠️ Контекстный компрессор: пропущена старая история диалога ...]\n\n"
-                    f"{history[-keep_tail_chars:]}"
-                )
-                return f"{header}{history_marker}{cut_history}"
-
-        # Резервный срез (сохраняя начало с описанием инструментов)
-        ratio = limit / current_tokens
-        keep_head_chars = int(len(prompt) * ratio * 0.40)
-        keep_tail_chars = int(len(prompt) * ratio * 0.50)
-        return (
-            f"{prompt[:keep_head_chars]}\n\n"
-            f"[... ⚠️ Контекстный компрессор: пропущено из-за лимита токенов ...]\n\n"
-            f"{prompt[-keep_tail_chars:]}"
+        logger.info(
+            f"Промпт ({curr_tokens:,} токенов, {prompt_bytes:,} байт) превысил лимит "
+            f"({limit:,} ток., {effective_max_bytes or 'unlimited'} байт). Применяется адаптивное сжатие..."
         )
+
+        # Вычисляем целевой размер в символах с учетом байтовой плотности кодировки (UTF-8)
+        bytes_per_char = max(1.0, prompt_bytes / max(1, len(prompt)))
+        if effective_max_bytes and prompt_bytes > effective_max_bytes:
+            target_char_len = int((effective_max_bytes - 800) / bytes_per_char)
+        else:
+            target_char_len = int(limit * 3.0 / bytes_per_char)
+
+        # 1. Приоритетное сжатие истории: если в промпте есть блок истории диалога,
+        # системные инструкции и блок доступных инструментов (# Available Tools / # Tool Call Instructions)
+        # сохраняются ПОЛНОСТЬЮ без обрезки!
+        for marker in ["\nConversation History:\n", "\n\nConversation History:\n", "Conversation History:\n"]:
+            if marker in prompt:
+                header, history = prompt.split(marker, 1)
+                header_with_marker = header + marker
+                header_bytes = len(header_with_marker.encode("utf-8"))
+                remaining_bytes = (effective_max_bytes - 800) - header_bytes if effective_max_bytes else (target_char_len - len(header_with_marker))
+
+                # Если под историю остается разумный бюджет (> 3000 байт/символов)
+                if remaining_bytes > 3000:
+                    h_bytes_per_char = max(1.0, len(history.encode("utf-8")) / max(1, len(history)))
+                    h_target_chars = int(remaining_bytes / h_bytes_per_char)
+                    if len(history) > h_target_chars:
+                        h_head_chars = int(h_target_chars * 0.20)
+                        h_tail_chars = int(h_target_chars * 0.75)
+                        h_head = history[:h_head_chars]
+                        h_tail = history[-h_tail_chars:]
+                        omitted = len(history) - (h_head_chars + h_tail_chars)
+                        omitted_tokens = int(omitted / 3.2)
+                        return (
+                            f"{header_with_marker}{h_head}\n\n"
+                            f"[... ⚡ Интеллектуальное сжатие контекста: сжато {omitted:,} символов (~{omitted_tokens:,} токенов) "
+                            f"промежуточных логов и истории для удержания фокуса модели в пределах {limit:,} токенов ...]\n\n"
+                            f"{h_tail}"
+                        )
+
+        # 2. Общий fallback для произвольного сырого текста без маркеров истории
+        head_chars = int(target_char_len * 0.35)
+        tail_chars = int(target_char_len * 0.55)
+
+        if head_chars + tail_chars >= len(prompt):
+            return prompt
+
+        head = prompt[:head_chars]
+        tail = prompt[-tail_chars:]
+        omitted_chars = len(prompt) - (head_chars + tail_chars)
+        omitted_tokens = int(omitted_chars / 3.2)
+
+        compressed = (
+            f"{head}\n\n"
+            f"[... ⚡ Интеллектуальное сжатие контекста: сжато {omitted_chars:,} символов (~{omitted_tokens:,} токенов) "
+            f"промежуточных логов и истории для удержания фокуса модели в пределах {limit:,} токенов ...]\n\n"
+            f"{tail}"
+        )
+        return compressed
 
 
 context_compressor = ContextCompressor()

@@ -209,6 +209,20 @@ class SSEParser:
                 session_id=self.session_id
             )
 
+        # 3.5. event: hint (ошибки валидации от DeepSeek, например input_exceeds_limit)
+        if event_type == "hint":
+            err_content = ""
+            if isinstance(data, dict):
+                err_content = data.get("content") or data.get("finish_reason") or ""
+            elif isinstance(data, str):
+                err_content = data
+            logger.warning(f"DeepSeek вернул событие hint: {err_content}")
+            return StreamChunk(
+                type="error",
+                text=f"DeepSeek error: {err_content}",
+                session_id=self.session_id,
+            )
+
         # 4. event: close
         if event_type == "close":
             self.is_finished = True
