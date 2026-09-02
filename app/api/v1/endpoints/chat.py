@@ -118,6 +118,7 @@ async def openai_chat_completions(
         async def sse_generator() -> AsyncGenerator[str, None]:
             first_chunk_sent = False
             accumulated_content = []
+            accumulated_thinking = []
             has_tools = bool(request.tools)
             active_provider = provider
 
@@ -126,29 +127,42 @@ async def openai_chat_completions(
                     if chunk.type == "error":
                         raise HTTPException(status_code=400, detail=chunk.text)
 
-                    if not first_chunk_sent and chunk.type in ["thinking", "content"]:
-                        first_chunk = OpenAIChatCompletionChunk(
-                            id=req_id,
-                            model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
-                        )
-                        yield f"data: {first_chunk.model_dump_json()}\n\n"
-                        first_chunk_sent = True
-
                     # Мысли модели (DeepSeek-R1 / Qwen)
                     if chunk.type == "thinking":
                         proxy_logger.log_thinking_chunk(log_id, chunk.text)
-                        c = OpenAIChatCompletionChunk(
-                            id=req_id,
-                            model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
-                        )
-                        yield f"data: {c.model_dump_json()}\n\n"
+                        accumulated_thinking.append(chunk.text)
+                        # В обычном диалоге без инструментов стримим мысли немедленно
+                        if not has_tools:
+                            if not first_chunk_sent:
+                                first_chunk = OpenAIChatCompletionChunk(
+                                    id=req_id,
+                                    model=request.model,
+                                    choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
+                                )
+                                yield f"data: {first_chunk.model_dump_json()}\n\n"
+                                first_chunk_sent = True
+
+                            c = OpenAIChatCompletionChunk(
+                                id=req_id,
+                                model=request.model,
+                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
+                            )
+                            yield f"data: {c.model_dump_json()}\n\n"
 
                     # Основной ответ
                     elif chunk.type == "content":
                         accumulated_content.append(chunk.text)
+                        # В обычном диалоге без инструментов стримим текст немедленно
                         if not has_tools:
+                            if not first_chunk_sent:
+                                first_chunk = OpenAIChatCompletionChunk(
+                                    id=req_id,
+                                    model=request.model,
+                                    choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
+                                )
+                                yield f"data: {first_chunk.model_dump_json()}\n\n"
+                                first_chunk_sent = True
+
                             proxy_logger.log_content_chunk(log_id, chunk.text)
                             c = OpenAIChatCompletionChunk(
                                 id=req_id,
@@ -165,8 +179,6 @@ async def openai_chat_completions(
                     clean_text, tool_calls = extract_tool_calls(full_text)
                     if tool_calls:
                         finish_reason = "tool_calls"
-                        if clean_text:
-                            proxy_logger.log_content_chunk(log_id, clean_text)
                         delta_tools = []
                         for idx, tc in enumerate(tool_calls):
                             proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
@@ -181,21 +193,49 @@ async def openai_chat_completions(
                                     ),
                                 )
                             )
+
+                        # Чанк 1: роль ассистента
+                        first_chunk = OpenAIChatCompletionChunk(
+                            id=req_id,
+                            model=request.model,
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
+                        )
+                        yield f"data: {first_chunk.model_dump_json()}\n\n"
+
+                        # Чанк 2: вызов инструментов с content: None (строгий стандарт OpenAI, не сбивающий ai-sdk)
                         c = OpenAIChatCompletionChunk(
                             id=req_id,
                             model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=clean_text or None, tool_calls=delta_tools))],
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=None, tool_calls=delta_tools))],
                         )
                         yield f"data: {c.model_dump_json()}\n\n"
                     else:
-                        if clean_text:
-                            proxy_logger.log_content_chunk(log_id, clean_text)
-                        c = OpenAIChatCompletionChunk(
+                        # Если инструментов не обнаружено, отдаем накопленные рассуждения и ответ
+                        first_chunk = OpenAIChatCompletionChunk(
                             id=req_id,
                             model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=clean_text or full_text))],
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
                         )
-                        yield f"data: {c.model_dump_json()}\n\n"
+                        yield f"data: {first_chunk.model_dump_json()}\n\n"
+
+                        if accumulated_thinking:
+                            th_text = "".join(accumulated_thinking)
+                            c = OpenAIChatCompletionChunk(
+                                id=req_id,
+                                model=request.model,
+                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=th_text))],
+                            )
+                            yield f"data: {c.model_dump_json()}\n\n"
+
+                        text_out = clean_text or full_text
+                        if text_out:
+                            proxy_logger.log_content_chunk(log_id, text_out)
+                            c = OpenAIChatCompletionChunk(
+                                id=req_id,
+                                model=request.model,
+                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=text_out))],
+                            )
+                            yield f"data: {c.model_dump_json()}\n\n"
 
                 # Завершающий чанк
                 final_chunk = OpenAIChatCompletionChunk(
@@ -243,19 +283,22 @@ async def openai_chat_completions(
             clean_text = resp.content
             tool_calls: Optional[List[OpenAIToolCall]] = None
             finish_reason = "stop"
+            reasoning_to_return = resp.thinking or None
 
             if request.tools:
                 clean_text, found_tool_calls = extract_tool_calls(resp.content)
                 if found_tool_calls:
                     tool_calls = found_tool_calls
                     finish_reason = "tool_calls"
+                    reasoning_to_return = None  # Не прикрепляем reasoning к tool_calls
+                    clean_text = None  # В OpenAI tool_calls ход content должен быть null
                     for tc in found_tool_calls:
                         proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
 
             choice_message = OpenAIChoiceMessage(
                 role="assistant",
                 content=clean_text,
-                reasoning_content=resp.thinking or None,
+                reasoning_content=reasoning_to_return,
                 tool_calls=tool_calls,
             )
 
