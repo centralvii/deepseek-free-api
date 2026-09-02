@@ -4,6 +4,7 @@ from app.services.sse_parser import SSEParser, parse_sse_stream, parse_sse_lines
 
 @pytest.mark.asyncio
 async def test_sse_parser_user_example():
+    """Тестирует парсер на точном примере SSE потока, предоставленном пользователем."""
     raw_events = [
         b"event: ready\r\ndata: {\"request_message_id\":1,\"response_message_id\":2,\"model_type\":\"expert\"}\r\n\r\n",
         b"event: update_session\r\ndata: {\"updated_at\":1788251660.8037179}\r\n\r\n",
@@ -45,6 +46,7 @@ async def test_sse_parser_user_example():
 
 @pytest.mark.asyncio
 async def test_sse_parser_thinking_and_response():
+    """Тестирует четкое разделение блоков рассуждений и ответа."""
     raw_events = [
         b'event: ready\r\ndata: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}\r\n\r\n',
         b'data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","thinking_enabled":true,"fragments":[{"id":1,"type":"THINKING","content":"First thought. "}]}}}\r\n\r\n',
@@ -73,6 +75,7 @@ async def test_sse_parser_thinking_and_response():
 
 @pytest.mark.asyncio
 async def test_sse_parser_batch_fragment_switch():
+    """Тестирует переключение рассуждений на ответ через BATCH операцию."""
     raw_events = [
         b'event: ready\r\ndata: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}\r\n\r\n',
         b'data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","thinking_enabled":true,"fragments":[{"id":1,"type":"THINKING","content":"Thinking..."}]}}}\r\n\r\n',
@@ -96,3 +99,35 @@ async def test_sse_parser_batch_fragment_switch():
 
     assert "".join(thinking) == "Thinking..."
     assert "".join(content) == "Hello world! How can I help?"
+
+
+@pytest.mark.asyncio
+async def test_sse_parser_real_deepseek_dump():
+    """Тестирует парсер на реальном залогированном ответе от chat.deepseek.com с R1."""
+    lines = [
+        'event: ready',
+        'data: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}',
+        'data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","thinking_enabled":true,"fragments":[{"id":1,"type":"THINKING","content":"Мы должны посчитать 2+2"}]}}}',
+        'data: {"p":"response/fragments/0/content","o":"APPEND","v":". Ответ равен 4."}',
+        'data: {"p":"response","o":"BATCH","v":[{"p":"fragments/0/status","o":"SET","v":"FINISHED"},{"p":"fragments","o":"APPEND","v":{"id":2,"type":"RESPONSE","content":"4"}}]}',
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}',
+        'event: close',
+        'data: {}',
+    ]
+
+    async def gen_lines():
+        for l in lines:
+            yield l
+
+    thinking = []
+    content = []
+    async for chunk in parse_sse_lines(gen_lines(), session_id="test-session"):
+        if chunk.type == "thinking":
+            thinking.append(chunk.text)
+        elif chunk.type == "content":
+            content.append(chunk.text)
+
+    th = "".join(thinking)
+    ct = "".join(content)
+    assert "Мы должны" in th
+    assert ct == "4"
