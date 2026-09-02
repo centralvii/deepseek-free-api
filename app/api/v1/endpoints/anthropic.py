@@ -254,6 +254,10 @@ async def anthropic_messages(
                 # message_stop
                 yield "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
             except Exception as e:
+                try:
+                    active_provider.reset_session()
+                except Exception:
+                    pass
                 err_detail = getattr(e, "detail", str(e))
                 err_status = getattr(e, "status_code", 500)
                 proxy_logger.log_request_end(log_id, status_code=err_status, error=str(err_detail))

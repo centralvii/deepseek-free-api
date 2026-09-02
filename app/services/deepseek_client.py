@@ -1,18 +1,18 @@
 import json
 import logging
 from typing import AsyncGenerator, List, Optional
-import httpx
 from fastapi import HTTPException, status
+import httpx
 
 from app.core.config import settings
 from app.core.credentials import credentials_manager
-from app.core.pow_solver import pow_solver
 from app.schemas.chat import (
     DeepSeekChatRequest,
     DeepSeekChatResponse,
     ModelInfo,
     StreamChunk,
 )
+from app.services.pow_solver import pow_solver
 from app.services.session_manager import session_manager
 from app.services.sse_parser import parse_sse_lines, parse_sse_stream
 
@@ -72,10 +72,10 @@ AVAILABLE_MODELS = [
 
 
 class DeepSeekClient:
-    """Клиент для выполнения реверс-инжиниринговых запросов к веб-API chat.deepseek.com."""
+    """Клиент для взаимодействия с веб-интерфейсом DeepSeek (с поддержкой PoW и SSE-стриминга)."""
 
-    def __init__(self, http_client: httpx.AsyncClient):
-        self.client = http_client
+    def __init__(self, http_client: Optional[httpx.AsyncClient] = None):
+        self.client = http_client or httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT)
 
     def get_models(self) -> List[ModelInfo]:
         return AVAILABLE_MODELS
@@ -92,7 +92,7 @@ class DeepSeekClient:
         # 1. Модели семейства DeepSeek V4
         if model_lower in ["deepseek-v4-pro", "v4-pro", "v4", "deepseek-v4", "pro"]:
             model_type = "expert"
-            think = True if thinking_enabled is None else thinking_enabled
+            think = False if thinking_enabled is None else thinking_enabled
             search = False
         elif model_lower in ["deepseek-v4-flash", "v4-flash", "flash"]:
             model_type = "default"

@@ -205,6 +205,10 @@ async def openai_chat_completions(
                 proxy_logger.log_request_end(log_id, status_code=200, tokens_out=len(accumulated_content))
 
             except Exception as e:
+                try:
+                    active_provider.reset_session()
+                except Exception:
+                    pass
                 err_detail = getattr(e, "detail", str(e))
                 err_status = getattr(e, "status_code", 500)
                 proxy_logger.log_request_end(log_id, status_code=err_status, error=str(err_detail))
@@ -271,5 +275,9 @@ async def openai_chat_completions(
                 ),
             )
         except Exception as e:
+            try:
+                provider.reset_session()
+            except Exception:
+                pass
             proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
             raise
