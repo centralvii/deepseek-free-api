@@ -247,3 +247,21 @@ def test_deepseek_dsml_tool_calls_extraction():
     assert clean_text == "Let me explore the project."
     assert "DSML" not in clean_text
     assert "<｜" not in clean_text
+
+
+def test_naked_json_tool_call_with_unescaped_quotes():
+    """Тестирует извлечение голого JSON без тегов tool_call и с неэкранированными кавычками внутри команды."""
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """Изучу проект, чтобы понять текущую структуру парсера.
+
+{"name": "Bash", "arguments": {"command":"cd /e/vibecoding/stepik-searcher && ls -la && echo "---TRACKED---" && git ls-files | grep -v '^"' | grep -vi 'FILES' | head -200","description":"List project files excluding noisy FILES dir"}}"""
+
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 1
+    assert calls[0].function.name == "Bash"
+    assert "cd /e/vibecoding/stepik-searcher" in calls[0].function.arguments
+    assert "List project files" in calls[0].function.arguments
+    assert clean_text == "Изучу проект, чтобы понять текущую структуру парсера."
+    assert "{" not in clean_text
+    assert "Bash" not in clean_text

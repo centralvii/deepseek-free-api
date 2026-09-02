@@ -124,6 +124,55 @@ def normalize_qwen_parameter_tags(text: str) -> str:
     return normalized
 
 
+def _parse_broken_arguments(args_str: str) -> Dict[str, Any]:
+    """
+    Устойчивый парсер аргументов инструмента:
+    - Восстанавливает JSON с неэкранированными внутренними кавычками (например, внутри shell-команд: echo "...", grep '...').
+    - Извлекает ключи и значения через позиционный сплит пар.
+    """
+    s = args_str.strip()
+    if s.startswith("{") and s.endswith("}"):
+        s = s[1:-1].strip()
+
+    try:
+        data = json.loads(args_str, strict=False)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    key_pat = re.compile(r'"([a-zA-Z0-9_\-]+)"\s*:\s*')
+    matches = list(key_pat.finditer(s))
+    if not matches:
+        return {}
+
+    result = {}
+    for i in range(len(matches)):
+        key = matches[i].group(1)
+        val_start = matches[i].end()
+        val_end = matches[i + 1].start() if i + 1 < len(matches) else len(s)
+
+        raw_val = s[val_start:val_end].strip()
+        if raw_val.endswith(","):
+            raw_val = raw_val[:-1].strip()
+        if raw_val.startswith('"') and raw_val.endswith('"') and len(raw_val) >= 2:
+            raw_val = raw_val[1:-1]
+        elif raw_val.startswith('"'):
+            raw_val = raw_val[1:]
+        elif raw_val.endswith('"'):
+            raw_val = raw_val[:-1]
+
+        if (raw_val.startswith("{") and raw_val.endswith("}")) or (raw_val.startswith("[") and raw_val.endswith("]")):
+            try:
+                raw_val = json.loads(raw_val)
+            except Exception:
+                pass
+
+        result[key] = raw_val
+
+    return result
+
+
 def _parse_all_tool_json(raw_json: str) -> List[Tuple[str, str]]:
     """Парсит все JSON-объекты (один или несколько параллельных) из блока tool_call."""
     results: List[Tuple[str, str]] = []
@@ -180,6 +229,30 @@ def _parse_all_tool_json(raw_json: str) -> List[Tuple[str, str]]:
                     results.append((str(name).strip(), args_str))
         except Exception:
             pass
+
+    # Fallback 3: парсим поврежденный JSON с неэкранированными внутренними кавычками
+    if not results:
+        name_match = re.search(r'"(?:name|function)"\s*:\s*"([a-zA-Z0-9_\-\.]+)"', s)
+        if name_match:
+            name = name_match.group(1).strip()
+            args_start = re.search(r'"(?:arguments|parameters|input)"\s*:\s*(\{)', s)
+            if args_start:
+                brace_start = args_start.start(1)
+                brace_count = 0
+                brace_end = -1
+                for i in range(brace_start, len(s)):
+                    if s[i] == '{':
+                        brace_count += 1
+                    elif s[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            brace_end = i + 1
+                            break
+                if brace_end != -1:
+                    args_raw = s[brace_start:brace_end]
+                    args_dict = _parse_broken_arguments(args_raw)
+                    if args_dict:
+                        results.append((name, json.dumps(args_dict, ensure_ascii=False)))
 
     return results
 
@@ -325,5 +398,79 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
                 )
             )
     clean_text = re.sub(func_pat, "", clean_text, flags=re.DOTALL)
+
+    # 4. Проверка "голого" JSON вызова инструмента без обрамляющих тегов (Naked JSON tool call)
+    naked_pat = re.compile(
+        r'\{\s*"(?:name|function)"\s*:\s*"([a-zA-Z0-9_\-\.]+)"\s*,\s*"(?:arguments|parameters|input)"\s*:\s*(\{)',
+        re.DOTALL
+    )
+    for match in naked_pat.finditer(clean_text):
+        name = match.group(1).strip()
+        start_idx = match.start()
+        args_brace_start = match.start(2)
+
+        brace_count = 0
+        args_end_idx = -1
+        for i in range(args_brace_start, len(clean_text)):
+            if clean_text[i] == '{':
+                brace_count += 1
+            elif clean_text[i] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    args_end_idx = i + 1
+                    break
+
+        if args_end_idx == -1:
+            continue
+
+        args_raw = clean_text[args_brace_start:args_end_idx]
+        outer_end_idx = clean_text.find('}', args_end_idx)
+        if outer_end_idx != -1:
+            outer_end_idx += 1
+        else:
+            outer_end_idx = args_end_idx
+
+        block = clean_text[start_idx:outer_end_idx]
+        args_dict = _parse_broken_arguments(args_raw)
+        args_str = json.dumps(args_dict, ensure_ascii=False) if args_dict else "{}"
+
+        call_key = (name, args_str)
+        if call_key not in seen_calls:
+            seen_calls.add(call_key)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=call_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
+                )
+            )
+        clean_text = clean_text.replace(block, "")
+
+    # Реверсивный порядок: {"arguments": ..., "name": "..."}
+    naked_rev_pat = re.compile(
+        r'\{\s*"(?:arguments|parameters|input)"\s*:\s*(\{.*?\}).*?,\s*"(?:name|function)"\s*:\s*"([a-zA-Z0-9_\-\.]+)"\s*\}',
+        re.DOTALL
+    )
+    for match in naked_rev_pat.finditer(clean_text):
+        args_raw = match.group(1).strip()
+        name = match.group(2).strip()
+        block = match.group(0)
+
+        args_dict = _parse_broken_arguments(args_raw)
+        args_str = json.dumps(args_dict, ensure_ascii=False) if args_dict else "{}"
+
+        call_key = (name, args_str)
+        if call_key not in seen_calls:
+            seen_calls.add(call_key)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=call_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
+                )
+            )
+        clean_text = clean_text.replace(block, "")
 
     return clean_text.strip(), tool_calls
