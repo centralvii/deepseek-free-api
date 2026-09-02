@@ -83,6 +83,8 @@ async def anthropic_messages(
             in_text_block = False
             message_started = False
             accumulated_content = []
+            accumulated_thinking = []
+            has_tools = bool(request.tools)
             active_provider = provider
 
             def emit_start():
@@ -110,33 +112,39 @@ async def anthropic_messages(
                     if chunk.type == "error":
                         raise HTTPException(status_code=400, detail=chunk.text)
 
-                    ev = emit_start()
-                    if ev:
-                        yield ev
-
                     # Блок рассуждений (Thinking)
                     if chunk.type == "thinking":
                         proxy_logger.log_thinking_chunk(log_id, chunk.text)
-                        if not in_thinking_block:
-                            cb_start = {
-                                "type": "content_block_start",
-                                "index": block_index,
-                                "content_block": {"type": "thinking", "thinking": ""},
-                            }
-                            yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                            in_thinking_block = True
+                        accumulated_thinking.append(chunk.text)
+                        if not has_tools:
+                            ev = emit_start()
+                            if ev:
+                                yield ev
 
-                        cb_delta = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "thinking_delta", "thinking": chunk.text},
-                        }
-                        yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+                            if not in_thinking_block:
+                                cb_start = {
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {"type": "thinking", "thinking": ""},
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+                                in_thinking_block = True
+
+                            cb_delta = {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "thinking_delta", "thinking": chunk.text},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
 
                     # Блок текста ответа (Content)
                     elif chunk.type == "content":
                         accumulated_content.append(chunk.text)
                         if not has_tools:
+                            ev = emit_start()
+                            if ev:
+                                yield ev
+
                             proxy_logger.log_content_chunk(log_id, chunk.text)
                             if in_thinking_block:
                                 cb_stop = {"type": "content_block_stop", "index": block_index}
@@ -172,26 +180,12 @@ async def anthropic_messages(
                 # Если были запрошены инструменты, проверяем наличие tool_calls
                 if has_tools:
                     clean_text, tool_calls = extract_tool_calls(full_text)
-                    if clean_text:
-                        proxy_logger.log_content_chunk(log_id, clean_text)
-                        cb_start = {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "text", "text": ""},
-                        }
-                        yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                        cb_delta = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "text_delta", "text": clean_text},
-                        }
-                        yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-                        cb_stop = {"type": "content_block_stop", "index": block_index}
-                        yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                        block_index += 1
-
                     if tool_calls:
                         stop_reason = "tool_use"
+                        ev = emit_start()
+                        if ev:
+                            yield ev
+
                         for tc in tool_calls:
                             proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
                             try:
@@ -225,22 +219,46 @@ async def anthropic_messages(
                             cb_stop = {"type": "content_block_stop", "index": block_index}
                             yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
                             block_index += 1
-                    elif not clean_text and full_text:
-                        cb_start = {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "text", "text": ""},
-                        }
-                        yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
-                        cb_delta = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "text_delta", "text": full_text},
-                        }
-                        yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
-                        cb_stop = {"type": "content_block_stop", "index": block_index}
-                        yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                        block_index += 1
+                    else:
+                        ev = emit_start()
+                        if ev:
+                            yield ev
+
+                        if accumulated_thinking:
+                            th_full = "".join(accumulated_thinking)
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+                            cb_delta = {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "thinking_delta", "thinking": th_full},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+                            cb_stop = {"type": "content_block_stop", "index": block_index}
+                            yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                            block_index += 1
+
+                        text_out = clean_text or full_text
+                        if text_out:
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n"
+                            cb_delta = {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": text_out},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n"
+                            cb_stop = {"type": "content_block_stop", "index": block_index}
+                            yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                            block_index += 1
                 else:
                     if in_text_block:
                         cb_stop = {"type": "content_block_stop", "index": block_index}

@@ -10,19 +10,32 @@ from app.schemas.anthropic import (
     AnthropicUsage,
 )
 from app.schemas.chat import DeepSeekChatRequest, DeepSeekChatResponse
-from app.services.tool_parser import extract_tool_calls
+from app.services.tool_parser import compact_tool_schema, extract_tool_calls
 
 
 def build_anthropic_tools_prompt(tools: List[AnthropicTool]) -> str:
     """Генерирует системную инструкцию инструментов из формата Anthropic."""
+    raw_schema_chars = sum(
+        len(json.dumps(tool.input_schema or {}))
+        for tool in tools
+    )
+    should_compact = raw_schema_chars > 12_000 or len(tools) > 15
+
     tools_definitions = []
     for tool in tools:
+        desc = str(tool.description or "").strip()
+        if len(desc) > 350:
+            desc = desc[:347] + "..."
+        params = tool.input_schema or {"type": "object", "properties": {}}
+        if should_compact:
+            params = compact_tool_schema(params)
+
         tools_definitions.append({
             "type": "function",
             "function": {
                 "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.input_schema or {"type": "object", "properties": {}},
+                "description": desc,
+                "parameters": params,
             }
         })
 
@@ -37,16 +50,18 @@ You have access to the following functions/tools to assist the user:
 ```
 
 # Tool Call Instructions
-CRITICAL REQUIREMENT:
-- When the user asks you to create, write, edit, replace, or modify files, or execute commands, you MUST NOT merely output code or commands in markdown.
-- You MUST invoke the appropriate tool using a `<tool_call>` block with a valid JSON object containing `"name"` and `"arguments"`.
-- DIRECT TOOL EXECUTION: When performing file operations (reading, writing, editing, listing, or searching files) or terminal commands, invoke the direct tool (such as Read, Write, Edit, Bash, Glob, Grep) directly. Do NOT delegate file operations to subagent tools (like `Agent` or `Task`).
-- PURE JSON FORMAT: Output clean, strictly valid JSON inside `<tool_call>`. Never output XML parameter tags (such as `<parameter=...>` or `</parameter>`).
-
-Example format:
+CRITICAL RULES:
+1. You ONLY REASON and REQUEST tool executions. You do NOT execute any commands or files yourself.
+2. When performing actions (reading, writing, editing files, searching, running terminal commands), REQUEST the tool call.
+3. NEVER simulate, guess, or fabricate command or tool output — output the tool call and wait for the actual result from the system.
+4. When requesting a tool, output ONLY the tool call. Do NOT add explanation, text, or markdown before or after the tool call.
+5. PURE JSON FORMAT: Output strictly valid JSON inside `<tool_call>...</tool_call>`:
 <tool_call>
-{{"name": "tool_name", "arguments": {{"param1": "value1"}}}}
+{{"name": "<function_name>", "arguments": {{...}}}}
 </tool_call>
+
+Alternatively, standard JSON format is also accepted:
+{{"tool_call": {{"name": "<function_name>", "arguments": {{...}}}}}}
 
 If no tool call is needed, provide your normal conversational response directly.
 """.strip()
@@ -157,26 +172,16 @@ def convert_deepseek_response_to_anthropic(
     """Преобразует синхронный ответ DeepSeek в AnthropicMessagesResponse."""
     content_blocks: List[AnthropicContentBlock] = []
 
-    # 1. Если есть рассуждения, добавляем блок thinking
-    if resp.thinking:
-        content_blocks.append(
-            AnthropicContentBlock(
-                type="thinking",
-                thinking=resp.thinking,
-            )
-        )
-
-    # 2. Обрабатываем основной текст и вызовы инструментов
+    # 1. Обрабатываем вызовы инструментов
     clean_text = resp.content
     stop_reason = "end_turn"
+    found_tool_calls = None
 
     if has_tools:
-        clean_text, tool_calls = extract_tool_calls(resp.content)
-        if tool_calls:
+        clean_text, found_tool_calls = extract_tool_calls(resp.content)
+        if found_tool_calls:
             stop_reason = "tool_use"
-            if clean_text:
-                content_blocks.append(AnthropicContentBlock(type="text", text=clean_text))
-            for tc in tool_calls:
+            for tc in found_tool_calls:
                 try:
                     args_dict = json.loads(tc.function.arguments)
                 except Exception:
@@ -189,10 +194,16 @@ def convert_deepseek_response_to_anthropic(
                         input=args_dict,
                     )
                 )
-        else:
-            if clean_text:
-                content_blocks.append(AnthropicContentBlock(type="text", text=clean_text))
-    else:
+
+    # 2. Если вызовов инструментов не было, добавляем thinking и text блоки
+    if not found_tool_calls:
+        if resp.thinking:
+            content_blocks.append(
+                AnthropicContentBlock(
+                    type="thinking",
+                    thinking=resp.thinking,
+                )
+            )
         if clean_text:
             content_blocks.append(AnthropicContentBlock(type="text", text=clean_text))
 
