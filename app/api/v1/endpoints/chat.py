@@ -1,10 +1,14 @@
 import json
+import logging
 import time
 import uuid
 from typing import Annotated, AsyncGenerator, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 import httpx
+
+logger = logging.getLogger(__name__)
+
 
 from app.api.deps import get_http_client
 from app.providers.registry import provider_registry
@@ -111,40 +115,88 @@ async def openai_chat_completions(
     # 2. Потоковый режим (Streaming)
     if request.stream:
         async def sse_generator() -> AsyncGenerator[str, None]:
-            # Первое сообщение: объявление роли
-            first_chunk = OpenAIChatCompletionChunk(
-                id=req_id,
-                model=request.model,
-                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
-            )
-            yield f"data: {first_chunk.model_dump_json()}\n\n"
-
+            first_chunk_sent = False
             accumulated_content = []
             has_tools = bool(request.tools)
+            active_provider = provider
 
             try:
-                async for chunk in provider.stream_chat(deepseek_req):
-                    # Мысли модели (DeepSeek-R1 / Qwen)
-                    if chunk.type == "thinking":
-                        proxy_logger.log_thinking_chunk(log_id, chunk.text)
-                        c = OpenAIChatCompletionChunk(
-                            id=req_id,
-                            model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
-                        )
-                        yield f"data: {c.model_dump_json()}\n\n"
+                try:
+                    async for chunk in active_provider.stream_chat(deepseek_req):
+                        if not first_chunk_sent and chunk.type in ["thinking", "content"]:
+                            first_chunk = OpenAIChatCompletionChunk(
+                                id=req_id,
+                                model=request.model,
+                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
+                            )
+                            yield f"data: {first_chunk.model_dump_json()}\n\n"
+                            first_chunk_sent = True
 
-                    # Основной ответ
-                    elif chunk.type == "content":
-                        proxy_logger.log_content_chunk(log_id, chunk.text)
-                        accumulated_content.append(chunk.text)
-                        if not has_tools:
+                        # Мысли модели (DeepSeek-R1 / Qwen)
+                        if chunk.type == "thinking":
+                            proxy_logger.log_thinking_chunk(log_id, chunk.text)
                             c = OpenAIChatCompletionChunk(
                                 id=req_id,
                                 model=request.model,
-                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=chunk.text))],
+                                choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
                             )
                             yield f"data: {c.model_dump_json()}\n\n"
+
+                        # Основной ответ
+                        elif chunk.type == "content":
+                            proxy_logger.log_content_chunk(log_id, chunk.text)
+                            accumulated_content.append(chunk.text)
+                            if not has_tools:
+                                c = OpenAIChatCompletionChunk(
+                                    id=req_id,
+                                    model=request.model,
+                                    choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=chunk.text))],
+                                )
+                                yield f"data: {c.model_dump_json()}\n\n"
+
+                except Exception as stream_err:
+                    # Если Qwen заблокирован Alibaba WAF/капчей, а данные клиенту еще не ушли:
+                    if active_provider.provider_id == "qwen" and not first_chunk_sent:
+                        ds_provider = provider_registry.get_provider("deepseek")
+                        if ds_provider and ds_provider.is_authenticated():
+                            logger.warning(
+                                f"⚠️ Qwen API отклонил запрос (WAF / перегрузка: {stream_err}). "
+                                f"Автоматическое бесшовное переключение на DeepSeek V4 Pro..."
+                            )
+                            deepseek_req.model = "deepseek-v4-pro"
+                            async for chunk in ds_provider.stream_chat(deepseek_req):
+                                if not first_chunk_sent and chunk.type in ["thinking", "content"]:
+                                    first_chunk = OpenAIChatCompletionChunk(
+                                        id=req_id,
+                                        model=request.model,
+                                        choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(role="assistant"))],
+                                    )
+                                    yield f"data: {first_chunk.model_dump_json()}\n\n"
+                                    first_chunk_sent = True
+
+                                if chunk.type == "thinking":
+                                    proxy_logger.log_thinking_chunk(log_id, chunk.text)
+                                    c = OpenAIChatCompletionChunk(
+                                        id=req_id,
+                                        model=request.model,
+                                        choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(reasoning_content=chunk.text))],
+                                    )
+                                    yield f"data: {c.model_dump_json()}\n\n"
+
+                                elif chunk.type == "content":
+                                    proxy_logger.log_content_chunk(log_id, chunk.text)
+                                    accumulated_content.append(chunk.text)
+                                    if not has_tools:
+                                        c = OpenAIChatCompletionChunk(
+                                            id=req_id,
+                                            model=request.model,
+                                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=chunk.text))],
+                                        )
+                                        yield f"data: {c.model_dump_json()}\n\n"
+                        else:
+                            raise stream_err
+                    else:
+                        raise stream_err
 
                 # Если были запрошены инструменты, проверяем сгенерированный текст на tool_calls
                 finish_reason = "stop"
@@ -193,8 +245,18 @@ async def openai_chat_completions(
                 proxy_logger.log_request_end(log_id, status_code=200, tokens_out=len(accumulated_content))
 
             except Exception as e:
-                proxy_logger.log_request_end(log_id, status_code=500, error=str(e))
-                raise
+                err_detail = getattr(e, "detail", str(e))
+                err_status = getattr(e, "status_code", 500)
+                proxy_logger.log_request_end(log_id, status_code=err_status, error=str(err_detail))
+                err_chunk = {
+                    "error": {
+                        "message": str(err_detail),
+                        "type": "provider_error",
+                        "code": err_status,
+                    }
+                }
+                yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             sse_generator(),
@@ -209,7 +271,22 @@ async def openai_chat_completions(
     # 3. Синхронный режим (Non-streaming)
     else:
         try:
-            resp = await provider.send_message(deepseek_req)
+            try:
+                resp = await provider.send_message(deepseek_req)
+            except Exception as send_err:
+                if provider.provider_id == "qwen":
+                    ds_provider = provider_registry.get_provider("deepseek")
+                    if ds_provider and ds_provider.is_authenticated():
+                        logger.warning(
+                            f"⚠️ Qwen API отклонил запрос ({send_err}). "
+                            f"Автоматическое бесшовное переключение на DeepSeek V4 Pro..."
+                        )
+                        deepseek_req.model = "deepseek-v4-pro"
+                        resp = await ds_provider.send_message(deepseek_req)
+                    else:
+                        raise send_err
+                else:
+                    raise send_err
 
             clean_text = resp.content
             tool_calls: Optional[List[OpenAIToolCall]] = None

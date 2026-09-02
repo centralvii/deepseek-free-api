@@ -68,3 +68,38 @@ async def test_multi_provider_credentials():
     finally:
         if orig_qwen:
             credentials_manager._tokens["qwen"] = orig_qwen
+
+
+@pytest.mark.asyncio
+async def test_qwen_waf_fallback_to_deepseek(monkeypatch):
+    """Проверяет, что при сбое Qwen WAF в режиме стриминга запрос автоматически переключается на DeepSeek."""
+    from app.schemas.chat import StreamChunk
+    from fastapi import HTTPException
+
+    qwen_p = provider_registry.get_provider("qwen")
+    ds_p = provider_registry.get_provider("deepseek")
+
+    # Мокаем ошибку WAF у Qwen
+    async def mock_qwen_stream_fail(*args, **kwargs):
+        raise HTTPException(status_code=403, detail="Alibaba WAF (Капча/Блокировка)")
+        yield  # make it a generator
+
+    # Мокаем успешный ответ у DeepSeek
+    async def mock_ds_stream_success(*args, **kwargs):
+        yield StreamChunk(type="content", text="Ответ от DeepSeek через fallback")
+
+    monkeypatch.setattr(qwen_p, "stream_chat", mock_qwen_stream_fail)
+    monkeypatch.setattr(ds_p, "stream_chat", mock_ds_stream_success)
+    monkeypatch.setattr(ds_p, "is_authenticated", lambda: True)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        req_payload = {
+            "model": "qwen-3.8-coder",
+            "messages": [{"role": "user", "content": "Привет"}],
+            "stream": True,
+        }
+        resp = await ac.post("/v1/chat/completions", json=req_payload)
+        assert resp.status_code == 200
+        text = resp.text
+        assert "Ответ от DeepSeek через fallback" in text
+        assert "data: [DONE]" in text
