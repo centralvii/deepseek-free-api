@@ -69,7 +69,7 @@ You have access to the following functions/tools to assist the user:
 # Tool Call Instructions
 CRITICAL RULES FOR TOOL CALLS:
 1. You ONLY REASON and REQUEST tool executions. You do NOT execute any commands or files yourself.
-2. DO NOT STOP with just a text promise or declaration of intent (such as "Изучу файлы...", "I will check...", "Let me read..."). When you need to inspect, read, search, edit, or run something, you MUST output the tool call in the SAME response!
+2. DO NOT STOP with just a text promise or declaration of intent (such as "Let me study...", "I will check...", "Изучу файлы...", "Let me explore..."). When you need to inspect, read, search, edit, or run something, you MUST output the tool call in the SAME response!
 3. NEVER simulate, guess, or fabricate command or tool output — output the tool call and wait for the actual result from the system.
 4. When requesting a tool, output valid JSON inside `<tool_call>...</tool_call>`:
 <tool_call>
@@ -79,7 +79,18 @@ CRITICAL RULES FOR TOOL CALLS:
 Alternatively, standard JSON format is also accepted:
 {{"tool_call": {{"name": "<function_name>", "arguments": {{...}}}}}}
 
-5. If no tool call is needed and the entire task is complete, provide your normal conversational response directly.
+5. EXAMPLE OF CORRECT BEHAVIOR:
+User: "Explore the codebase"
+Assistant:
+Let me study the files to understand the project structure.
+<tool_call>
+{{"name": "Bash", "arguments": {{"command": "git ls-files || ls -la"}}}}
+</tool_call>
+
+FORBIDDEN BEHAVIOR (NEVER DO THIS):
+Assistant: "Let me study the remaining backend files and frontend structure." -> WRONG! Never stop without the `<tool_call>` block!
+
+6. If no tool call is needed and the entire task is complete, provide your normal conversational response directly.
 """
     return prompt.strip()
 
@@ -319,8 +330,8 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     clean_text = text
 
     # 0. Проверка формата DeepSeek DSML: <｜DSML｜tool_calls>...<｜DSML｜invoke name="...">...</｜DSML｜invoke>...</｜DSML｜tool_calls>
-    dsml_invoke_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*invoke\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*invoke>"
-    dsml_param_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*parameter\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*parameter>"
+    dsml_invoke_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*invoke\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\\s*(.*?)\\s*</[｜\|]*\s*DSML\s*[｜\|]*invoke>"
+    dsml_param_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*parameter\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\\s*(.*?)\\s*</[｜\|]*\s*DSML\s*[｜\|]*parameter>"
 
     for match in re.finditer(dsml_invoke_pat, text, re.DOTALL):
         name = match.group(1).strip()
