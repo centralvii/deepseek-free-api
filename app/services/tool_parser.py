@@ -200,10 +200,45 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     seen_calls = set()
     clean_text = text
 
-    # Паттерны для поиска
+    # 1. Проверка формата Claude / Anthropic / DeepSeek: <invoke name="...">...</invoke>
+    invoke_pat = r"<invoke\s+name=[\"']?([a-zA-Z0-9_\-\.]+)[\"']?[^>]*>\s*(.*?)\s*</invoke>"
+    param_pat = r"<parameter\s+(?:name=[\"']?([a-zA-Z0-9_\-]+)[\"']?|=([a-zA-Z0-9_\-]+)|([a-zA-Z0-9_\-]+))[^>]*>\s*(.*?)\s*</parameter>"
+
+    for match in re.finditer(invoke_pat, text, re.DOTALL):
+        name = match.group(1).strip()
+        body = match.group(2).strip()
+        args_dict = {}
+        for pm in re.finditer(param_pat, body, re.DOTALL):
+            p_name = pm.group(1) or pm.group(2) or pm.group(3)
+            p_val = pm.group(4).strip()
+            if (p_val.startswith("{") and p_val.endswith("}")) or (p_val.startswith("[") and p_val.endswith("]")):
+                try:
+                    p_val = json.loads(p_val)
+                except Exception:
+                    pass
+            args_dict[p_name] = p_val
+
+        args_str = json.dumps(args_dict, ensure_ascii=False)
+        call_key = (name, args_str)
+        if call_key not in seen_calls:
+            seen_calls.add(call_key)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=call_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
+                )
+            )
+
+    # Очищаем блоки invoke (включая если они обернуты в <tool_call>...<invoke>...</tool_calls>)
+    clean_text = re.sub(r"<tool_calls?[^>]*>\s*(?:<invoke\b.*?</invoke>\s*)+</tool_calls?>", "", clean_text, flags=re.DOTALL)
+    clean_text = re.sub(invoke_pat, "", clean_text, flags=re.DOTALL)
+
+    # 2. Паттерны для поиска стандартных блоков JSON tool_call
     patterns = [
-        r"<tool_call[^>]*>\s*(.*?)\s*</tool_call[^>]*>",
-        r"```(?:tool_call|function_call)\s*(.*?)\s*```",
+        r"<tool_calls?[^>]*>\s*(.*?)\s*</tool_calls?[^>]*>",
+        r"```(?:tool_call|tool_calls|function_call)\s*(.*?)\s*```",
     ]
 
     for pat in patterns:

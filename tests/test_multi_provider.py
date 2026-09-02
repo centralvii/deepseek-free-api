@@ -201,3 +201,27 @@ def test_hybrid_qwen_parameter_tags_extraction():
     assert "find /e/vibecoding" in calls[0].function.arguments
     assert "List project files to understand structure" in calls[0].function.arguments
     assert "<parameter" not in clean_text
+
+
+def test_deepseek_claude_xml_invoke_extraction():
+    """Тестирует парсинг вызовов инструментов в формате Claude/DeepSeek XML (<invoke name=...>)."""
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """Let me start by exploring the project.
+
+<tool_call>
+<invoke name="Bash">
+<parameter name="command">cd /e/vibecoding/stepik-searcher && git ls-files | head -200</parameter>
+<parameter name="description">List tracked files in project</parameter>
+</invoke>
+</tool_calls>"""
+
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 1
+    assert calls[0].function.name == "Bash"
+    assert "cd /e/vibecoding/stepik-searcher" in calls[0].function.arguments
+    assert "List tracked files in project" in calls[0].function.arguments
+    assert clean_text == "Let me start by exploring the project."
+    assert "<invoke" not in clean_text
+    assert "<tool_call" not in clean_text
+    assert "<tool_calls" not in clean_text
