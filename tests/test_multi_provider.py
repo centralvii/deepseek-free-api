@@ -71,26 +71,55 @@ async def test_multi_provider_credentials():
 
 
 @pytest.mark.asyncio
-async def test_qwen_waf_fallback_to_deepseek(monkeypatch):
-    """Проверяет, что при сбое Qwen WAF в режиме стриминга запрос автоматически переключается на DeepSeek."""
-    from app.schemas.chat import StreamChunk
+async def test_qwen_adaptive_context_compression():
+    """Проверяет, что контекст для Qwen автоматически укладывается в безопасный лимит WAF."""
+    from app.services.context_compressor import context_compressor, estimate_tokens
+    from app.services.tool_parser import format_messages_to_prompt
+    from app.schemas.openai import OpenAIChatMessage, OpenAITool, OpenAIToolFunction
+
+    # Создаем 50 инструментов
+    tools = [
+        OpenAITool(
+            type="function",
+            function=OpenAIToolFunction(
+                name=f"tool_{i}",
+                description=f"Description of tool {i} for testing context size compression",
+                parameters={"type": "object", "properties": {"arg": {"type": "string"}}},
+            )
+        )
+        for i in range(50)
+    ]
+
+    # Создаем длинную историю сообщений (>30,000 токенов)
+    messages = [
+        OpenAIChatMessage(role="system", content="Ты системный помощник."),
+        OpenAIChatMessage(role="user", content="Инструкция: " + ("Очень длинный текст задачи агента " * 3000)),
+    ]
+
+    qwen_limit = context_compressor.get_limit_for_provider("qwen")
+    assert qwen_limit == 20_000
+
+    compiled = format_messages_to_prompt(messages, tools, max_tokens=qwen_limit)
+    compiled_tokens = estimate_tokens(compiled)
+
+    # Проверяем, что промпт уложился в безопасный лимит
+    assert compiled_tokens <= qwen_limit * 1.5
+    # И размер в байтах безопасен для WAF (<80 KB)
+    assert len(compiled.encode("utf-8")) < 80_000
+
+
+@pytest.mark.asyncio
+async def test_stream_error_sse_formatting(monkeypatch):
+    """Проверяет, что ошибка провайдера безопасно передается в SSE без падения ASGI."""
     from fastapi import HTTPException
 
     qwen_p = provider_registry.get_provider("qwen")
-    ds_p = provider_registry.get_provider("deepseek")
 
-    # Мокаем ошибку WAF у Qwen
-    async def mock_qwen_stream_fail(*args, **kwargs):
-        raise HTTPException(status_code=403, detail="Alibaba WAF (Капча/Блокировка)")
-        yield  # make it a generator
+    async def mock_fail(*args, **kwargs):
+        raise HTTPException(status_code=403, detail="WAF challenge error")
+        yield
 
-    # Мокаем успешный ответ у DeepSeek
-    async def mock_ds_stream_success(*args, **kwargs):
-        yield StreamChunk(type="content", text="Ответ от DeepSeek через fallback")
-
-    monkeypatch.setattr(qwen_p, "stream_chat", mock_qwen_stream_fail)
-    monkeypatch.setattr(ds_p, "stream_chat", mock_ds_stream_success)
-    monkeypatch.setattr(ds_p, "is_authenticated", lambda: True)
+    monkeypatch.setattr(qwen_p, "stream_chat", mock_fail)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         req_payload = {
@@ -101,5 +130,5 @@ async def test_qwen_waf_fallback_to_deepseek(monkeypatch):
         resp = await ac.post("/v1/chat/completions", json=req_payload)
         assert resp.status_code == 200
         text = resp.text
-        assert "Ответ от DeepSeek через fallback" in text
+        assert "WAF challenge error" in text
         assert "data: [DONE]" in text

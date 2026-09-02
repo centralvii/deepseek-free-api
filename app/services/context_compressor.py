@@ -71,6 +71,10 @@ class ContextCompressor:
     - Сжимает / уплотняет старую середину диалога и гигантские выводы инструментов.
     """
 
+    QWEN_MAX_WEB_TOKENS: int = 20_000
+    QWEN_MAX_PAYLOAD_BYTES: int = 70_000
+    DEFAULT_MAX_TOKENS: int = 300_000
+
     def __init__(
         self,
         max_context_tokens: Optional[int] = None,
@@ -80,6 +84,12 @@ class ContextCompressor:
         self.max_context_tokens = max_context_tokens or getattr(settings, "MAX_CONTEXT_TOKENS", 300_000)
         self.retain_recent_count = retain_recent_count or getattr(settings, "RETAIN_RECENT_MESSAGES_COUNT", 12)
         self.max_tool_tokens = max_tool_tokens or getattr(settings, "MAX_TOOL_OUTPUT_TOKENS", 25_000)
+
+    def get_limit_for_provider(self, provider_id: str) -> int:
+        """Возвращает безопасный лимит токенов контекста для конкретного провайдера."""
+        if str(provider_id).lower().strip() == "qwen":
+            return self.QWEN_MAX_WEB_TOKENS
+        return self.max_context_tokens
 
     def compress_openai_messages(
         self,
@@ -91,12 +101,13 @@ class ContextCompressor:
             return messages
 
         limit = max_tokens or self.max_context_tokens
+        tool_limit = min(self.max_tool_tokens, max(2_000, limit // 5))
         
         # 1. Сначала сжимаем гигантские tool выводы
         sanitized_messages: List[OpenAIChatMessage] = []
         for msg in messages:
             if msg.role in ["tool", "function"] and isinstance(msg.content, str):
-                compressed_content = truncate_tool_output(msg.content, max_tokens=self.max_tool_tokens)
+                compressed_content = truncate_tool_output(msg.content, max_tokens=tool_limit)
                 if compressed_content != msg.content:
                     # Создаем копию с усеченным контентом
                     msg_dict = msg.model_dump()
@@ -154,22 +165,37 @@ class ContextCompressor:
         self,
         prompt: str,
         max_tokens: Optional[int] = None,
+        max_bytes: Optional[int] = None,
     ) -> str:
-        """Сжимает текстовый промпт, если он превышает лимит ~300k токенов."""
+        """Сжимает текстовый промпт по токенам и байтам UTF-8 для безопасного прохождения веб-WAF."""
         if not prompt:
             return prompt
 
         limit = max_tokens or self.max_context_tokens
         curr_tokens = estimate_tokens(prompt)
-        if curr_tokens <= limit:
+        prompt_bytes = len(prompt.encode("utf-8"))
+        effective_max_bytes = max_bytes or (self.QWEN_MAX_PAYLOAD_BYTES if limit <= self.QWEN_MAX_WEB_TOKENS else None)
+
+        if curr_tokens <= limit and (not effective_max_bytes or prompt_bytes <= effective_max_bytes):
             return prompt
 
-        logger.info(f"Промпт ({curr_tokens:,} токенов) превысил лимит {limit:,}. Применяется сжатие...")
+        logger.info(
+            f"Промпт ({curr_tokens:,} токенов, {prompt_bytes:,} байт) превысил лимит "
+            f"({limit:,} ток., {effective_max_bytes or 'unlimited'} байт). Применяется адаптивное сжатие..."
+        )
 
-        # Сохраняем 20% начала (инструкции/системный промпт) и 50% конца (актуальная задача)
-        target_char_len = int(limit * 3.2)
-        head_chars = int(target_char_len * 0.25)
+        # Вычисляем целевой размер в символах с учетом байтовой плотности кодировки (UTF-8)
+        bytes_per_char = max(1.0, prompt_bytes / max(1, len(prompt)))
+        if effective_max_bytes and prompt_bytes > effective_max_bytes:
+            target_char_len = int((effective_max_bytes - 600) / bytes_per_char)
+        else:
+            target_char_len = int(limit * 3.0 / bytes_per_char)
+
+        head_chars = int(target_char_len * 0.35)
         tail_chars = int(target_char_len * 0.55)
+
+        if head_chars + tail_chars >= len(prompt):
+            return prompt
 
         head = prompt[:head_chars]
         tail = prompt[-tail_chars:]

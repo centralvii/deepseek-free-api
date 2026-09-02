@@ -26,7 +26,7 @@ def build_anthropic_tools_prompt(tools: List[AnthropicTool]) -> str:
             }
         })
 
-    tools_json = json.dumps(tools_definitions, ensure_ascii=False, indent=2)
+    tools_json = json.dumps(tools_definitions, ensure_ascii=False, separators=(",", ":"))
 
     return f"""
 # Available Tools
@@ -125,6 +125,9 @@ def convert_anthropic_request_to_deepseek(request: AnthropicMessagesRequest) -> 
         prompt_parts.append("Conversation History:\n" + "\n".join(history_messages))
 
     final_prompt = "\n\n".join(prompt_parts)
+
+    from app.services.context_compressor import context_compressor
+    final_prompt = context_compressor.compress_raw_prompt(final_prompt)
 
     # Определяем, включен ли режим рассуждений в Anthropic
     thinking_enabled = None
