@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Annotated, AsyncGenerator, List, Optional
@@ -27,6 +28,12 @@ from app.schemas.openai import (
     OpenAIUsage,
 )
 from app.services.tool_parser import extract_tool_calls, format_messages_to_prompt
+
+INTENT_PAT = re.compile(
+    r'(?:изучу|проверю|посмотрю|открою|прочитаю|найду|запущу|выполню|исследую|начну|let me (?:check|read|explore|inspect|run|look)|i will (?:check|read|explore|inspect|run|look))'
+    r'[^.!?\n]{0,80}(?:файл|код|проект|директори|папк|api|структур|file|code|dir|repo|output)',
+    re.IGNORECASE,
+)
 
 router = APIRouter(tags=["Chat"])
 
@@ -177,6 +184,33 @@ async def openai_chat_completions(
 
                 if has_tools:
                     clean_text, tool_calls = extract_tool_calls(full_text)
+
+                    # Continuation Recovery: если модель заявила о намерении изучить файлы/выполнить код,
+                    # но оборвала генерацию до вызова инструмента, запрашиваем продолжение
+                    if not tool_calls and INTENT_PAT.search(full_text):
+                        logger.info("Обнаружено заявление намерения действия без вызова инструмента. Запуск Continuation Recovery...")
+                        try:
+                            cont_req = DeepSeekChatRequest(
+                                prompt=(
+                                    f"{deepseek_req.prompt}\n\n"
+                                    f"[Assistant response so far]\n{full_text}\n\n"
+                                    f"[System Instruction: Continue immediately and output the tool call for the action you just announced. "
+                                    f"Output valid JSON inside <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> now.]"
+                                ),
+                                chat_session_id=deepseek_req.chat_session_id,
+                                model=deepseek_req.model,
+                                stream=False,
+                            )
+                            cont_resp = await active_provider.send_message(cont_req)
+                            cont_clean, cont_tools = extract_tool_calls(cont_resp.content)
+                            if cont_tools:
+                                tool_calls = cont_tools
+                                if cont_clean:
+                                    clean_text = (clean_text or full_text) + "\n" + cont_clean
+                                logger.info(f"✓ Continuation Recovery успешно извлек {len(cont_tools)} tool call(s)!")
+                        except Exception as cont_err:
+                            logger.warning(f"Ошибка Continuation Recovery: {cont_err}")
+
                     if tool_calls:
                         finish_reason = "tool_calls"
                         delta_tools = []
@@ -287,6 +321,31 @@ async def openai_chat_completions(
 
             if request.tools:
                 clean_text, found_tool_calls = extract_tool_calls(resp.content)
+
+                if not found_tool_calls and INTENT_PAT.search(resp.content):
+                    logger.info("Non-streaming: обнаружено намерение действия без вызова инструмента. Запуск Continuation Recovery...")
+                    try:
+                        cont_req = DeepSeekChatRequest(
+                            prompt=(
+                                f"{deepseek_req.prompt}\n\n"
+                                f"[Assistant response so far]\n{resp.content}\n\n"
+                                f"[System Instruction: Continue immediately and output the tool call for the action you just announced. "
+                                f"Output valid JSON inside <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> now.]"
+                            ),
+                            chat_session_id=deepseek_req.chat_session_id,
+                            model=deepseek_req.model,
+                            stream=False,
+                        )
+                        cont_resp = await provider.send_message(cont_req)
+                        cont_clean, cont_tools = extract_tool_calls(cont_resp.content)
+                        if cont_tools:
+                            found_tool_calls = cont_tools
+                            if cont_clean:
+                                clean_text = (clean_text or resp.content) + "\n" + cont_clean
+                            logger.info(f"✓ Non-streaming Continuation Recovery успешно извлек {len(cont_tools)} tool call(s)!")
+                    except Exception as cont_err:
+                        logger.warning(f"Ошибка Continuation Recovery: {cont_err}")
+
                 if found_tool_calls:
                     tool_calls = found_tool_calls
                     finish_reason = "tool_calls"
