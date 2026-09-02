@@ -21,41 +21,31 @@ def build_anthropic_tools_prompt(tools: List[AnthropicTool]) -> str:
     )
     should_compact = raw_schema_chars > 12_000 or len(tools) > 15
 
-    tools_definitions = []
+    tool_lines = []
     for tool in tools:
-        desc = str(tool.description or "").strip()
-        if len(desc) > 350:
-            desc = desc[:347] + "..."
+        desc = str(tool.description or "").strip().replace("\r\n", " ")
+        if len(desc) > 300:
+            desc = desc[:297] + "..."
         params = tool.input_schema or {"type": "object", "properties": {}}
         if should_compact:
             params = compact_tool_schema(params)
+        params_str = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+        tool_lines.append(f"## {tool.name}\nDescription: {desc}\nParameters: {params_str}")
 
-        tools_definitions.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": desc,
-                "parameters": params,
-            }
-        })
-
-    tools_json = json.dumps(tools_definitions, ensure_ascii=False, separators=(",", ":"))
+    tools_text = "\n\n".join(tool_lines)
 
     return f"""
 # Available Tools
 You have access to the following functions/tools to assist the user:
 
-```json
-{tools_json}
-```
+{tools_text}
 
 # Tool Call Instructions
-CRITICAL RULES:
+CRITICAL RULES FOR TOOL CALLS:
 1. You ONLY REASON and REQUEST tool executions. You do NOT execute any commands or files yourself.
-2. When performing actions (reading, writing, editing files, searching, running terminal commands), REQUEST the tool call.
+2. DO NOT STOP with just a text promise or declaration of intent (such as "Изучу файлы...", "I will check...", "Let me read..."). When you need to inspect, read, search, edit, or run something, you MUST output the tool call in the SAME response!
 3. NEVER simulate, guess, or fabricate command or tool output — output the tool call and wait for the actual result from the system.
-4. When requesting a tool, output ONLY the tool call. Do NOT add explanation, text, or markdown before or after the tool call.
-5. PURE JSON FORMAT: Output strictly valid JSON inside `<tool_call>...</tool_call>`:
+4. When requesting a tool, output valid JSON inside `<tool_call>...</tool_call>`:
 <tool_call>
 {{"name": "<function_name>", "arguments": {{...}}}}
 </tool_call>
@@ -63,7 +53,7 @@ CRITICAL RULES:
 Alternatively, standard JSON format is also accepted:
 {{"tool_call": {{"name": "<function_name>", "arguments": {{...}}}}}}
 
-If no tool call is needed, provide your normal conversational response directly.
+5. If no tool call is needed and the entire task is complete, provide your normal conversational response directly.
 """.strip()
 
 
@@ -142,6 +132,20 @@ def convert_anthropic_request_to_deepseek(request: AnthropicMessagesRequest) -> 
 
     if history_messages:
         prompt_parts.append("Conversation History:\n" + "\n".join(history_messages))
+
+    # 4. Если последнее сообщение содержит результат инструмента, требуем немедленно вызвать следующий инструмент
+    if request.messages:
+        last_msg = request.messages[-1]
+        is_tool_turn = False
+        if isinstance(last_msg.content, list):
+            for part in last_msg.content:
+                if (isinstance(part, dict) and part.get("type") == "tool_result") or getattr(part, "type", "") == "tool_result":
+                    is_tool_turn = True
+                    break
+        if is_tool_turn:
+            prompt_parts.append(
+                "\n[System Directive: The previous tool execution has finished and its output is provided above. Proceed with the task immediately. If you need to inspect more files or run commands, invoke the tool call NOW: <tool_call>{\"name\": \"...\", \"arguments\": {...}}</tool_call>. Do NOT stop with only a conversational promise or intent.]"
+            )
 
     final_prompt = "\n\n".join(prompt_parts)
 

@@ -297,3 +297,42 @@ def test_compact_tool_schema():
     assert compacted["properties"]["command"]["description"].endswith("...")
     assert len(compacted["properties"]["command"]["description"]) <= 120
     assert compacted["required"] == ["command"]
+
+
+def test_system_directive_after_tool_output():
+    """Тестирует добавление системной директивы при завершении вывода инструмента."""
+    from app.services.tool_parser import format_messages_to_prompt
+    from app.schemas.openai import OpenAIChatMessage, OpenAITool, OpenAIToolFunction
+
+    messages = [
+        OpenAIChatMessage(role="user", content="Найди файлы проекта"),
+        OpenAIChatMessage(role="assistant", content="Запускаю поиск"),
+        OpenAIChatMessage(role="tool", tool_call_id="call_1", content="file1.py\nfile2.py"),
+    ]
+    tools = [
+        OpenAITool(
+            type="function",
+            function=OpenAIToolFunction(
+                name="Bash",
+                description="Run shell command",
+                parameters={"type": "object", "properties": {"command": {"type": "string"}}},
+            )
+        )
+    ]
+
+    prompt = format_messages_to_prompt(messages, tools)
+    assert "[System Directive:" in prompt
+    assert "Do NOT stop with only a conversational promise" in prompt
+
+
+def test_intent_pattern_matching():
+    """Тестирует определение обещаний действия для Continuation Recovery."""
+    from app.api.v1.endpoints.chat import INTENT_PAT
+
+    sample1 = "Изучил структуру проекта. Теперь мне нужно понять, как в Stepik API представлены задания со стоимостью и текст заданий. Изучу оставшиеся файлы бэкенда и фронтенд-структуру."
+    sample2 = "Let me check the backend code to understand how endpoints are configured."
+    sample3 = "Вот готовый результат работы программы. Всего хорошего!"
+
+    assert INTENT_PAT.search(sample1) is not None
+    assert INTENT_PAT.search(sample2) is not None
+    assert INTENT_PAT.search(sample3) is None
