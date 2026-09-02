@@ -1,130 +1,285 @@
 import asyncio
-import datetime
-import logging
+import os
 import sys
-import time
-from typing import Any, Optional
-
+from typing import Optional
+import httpx
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
 
 from app.core.config import settings
 from app.core.credentials import credentials_manager
 from app.providers.registry import provider_registry
 from app.schemas.chat import DeepSeekChatRequest
-from app.services.banner import print_welcome_banner
-from app.services.proxy_logger import proxy_logger
+from app.services.session_manager import session_manager
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True, write_through=True)
+    except Exception:
+        pass
 
 console = Console()
 
+prompt_style = Style.from_dict({
+    "prompt": "#5fafff bold",
+    "completion-menu.completion": "bg:#202020 #cccccc",
+    "completion-menu.completion.current": "bg:#005f87 #ffffff bold",
+    "completion-menu.meta.completion": "bg:#202020 #888888",
+    "completion-menu.meta.completion.current": "bg:#005f87 #aaaaaa italic",
+    "bottom-toolbar": "bg:#1c1c1c #aaaaaa",
+})
 
-class DeepSeekCLI:
-    def __init__(self):
-        self.provider_id = provider_registry.default_provider_id
-        # Выбираем дефолтную модель по текущему провайдеру
-        if self.provider_id == "qwen":
-            self.model = "qwen3.7-plus"
-        else:
-            self.model = "deepseek-v4-pro"
-        self.session_id: Optional[str] = None
-        self.thinking_enabled: bool = False
-        self.search_enabled: bool = False
-        self.stream_mode: bool = True
-        self.available_models = {
-            "deepseek": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-reasoner", "deepseek-chat"],
-            "qwen": ["qwen3.7-plus", "qwen-3.8-coder", "qwen-3.8", "qwen3.8-max"],
+
+class MultiProviderCommandCompleter(Completer):
+    """Динамическое автодополнение команд и моделей для всех провайдеров."""
+
+    COMMANDS = {
+        "/proxy": "Режим Proxy-монитора (прослушка и логирование запросов от Cline / Roo / Cursor)",
+        "/login": "Войти через окно браузера и автоматически получить токен",
+        "/provider": "Переключить активного провайдера (deepseek, qwen)",
+        "/model": "Переключить модель LLM",
+        "/token": "Установить Bearer токен (например, /token qwen <токен>)",
+        "/think": "Режим рассуждений/мыслей (show / hide / off)",
+        "/search": "Веб-поиск в реальном времени (on / off)",
+        "/new": "Начать новый диалог (сбросить контекст)",
+        "/sessions": "Показать список предыдущих диалогов",
+        "/session": "Переключиться на диалог по его ID (например, /session <id>)",
+        "/status": "Показать статус провайдеров, модель и ID сессии",
+        "/clear": "Очистить экран терминала",
+        "/help": "Показать список доступных команд",
+        "/exit": "Выйти из консоли",
+        "/quit": "Выйти из консоли",
+    }
+
+    SUBCOMMANDS = {
+        "/proxy": {
+            "start": "Запустить прокси-сервер и режим мониторинга агентов",
+            "status": "Показать статус и эндпоинты для подключения Cline / Cursor",
+        },
+        "/login": {
+            "deepseek": "Открыть браузер и войти в DeepSeek",
+            "qwen": "Открыть браузер и войти в Qwen",
+        },
+        "/provider": {
+            "deepseek": "DeepSeek (V4 Pro, V4 Flash, R1 Reasoner, V3)",
+            "qwen": "Qwen Alibaba (Qwen 3.7 Plus, 3.8, 3.8-Coder, 3-Max, 3-Plus)",
+        },
+        "/think": {
+            "show": "Включить рассуждения и показывать блок мыслей",
+            "hide": "Включить рассуждения, но скрыть мысли (только ответ)",
+            "on": "Включить рассуждения (показывать мысли)",
+            "off": "Выключить рассуждения",
+        },
+        "/search": {
+            "on": "Включить поиск в интернете",
+            "off": "Выключить поиск",
+        },
+        "/model": {
+            # DeepSeek
+            "deepseek-v4-pro": "[DeepSeek] 1.6T MoE (49B act) рассуждения и сложный код",
+            "deepseek-v4-flash": "[DeepSeek] 284B MoE сверхбыстрый чат",
+            "deepseek-v4-flash-vision-exp": "[DeepSeek] Мультимодальная модель",
+            "deepseek-reasoner": "[DeepSeek] R1 модель пошаговых рассуждений",
+            "deepseek-chat": "[DeepSeek] V3 универсальный чат",
+            "deepseek-search": "[DeepSeek] V3 с веб-поиском",
+            # Qwen
+            "qwen3.7-plus": "[Qwen] Актуальная веб-модель Qwen 3.7 Plus (Thinking)",
+            "qwen-3.8": "[Qwen] Флагман 3-го поколения с рассуждениями",
+            "qwen-3.8-coder": "[Qwen] Специализированная модель для сложного кодинга",
+            "qwen-3-max": "[Qwen] Максимальная интеллектуальная мощность",
+            "qwen-3-plus": "[Qwen] Быстрый универсальный ассистент",
+            "qwen-3-flash": "[Qwen] Zero-Latency мгновенные ответы",
+        },
+        "/token": {
+            "deepseek": "Установить токен для DeepSeek",
+            "qwen": "Установить токен для Qwen",
         }
+    }
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+
+        parts = text.split()
+        if len(parts) == 0:
+            return
+
+        if len(parts) == 1 and not text.endswith(" "):
+            prefix = parts[0]
+            for cmd, desc in self.COMMANDS.items():
+                if cmd.startswith(prefix):
+                    yield Completion(cmd, start_position=-len(prefix), display_meta=desc)
+        else:
+            cmd = parts[0]
+            if cmd in self.SUBCOMMANDS:
+                sub_dict = self.SUBCOMMANDS[cmd]
+                sub_prefix = parts[1] if len(parts) > 1 and not text.endswith(" ") else ""
+                for sub_cmd, desc in sub_dict.items():
+                    if sub_cmd.startswith(sub_prefix):
+                        yield Completion(sub_cmd, start_position=-len(sub_prefix), display_meta=desc)
+
+
+class MultiProviderCLI:
+    def __init__(self):
+        self.provider_id = "deepseek"
+        self.model = "deepseek-v4-pro"
+        self.thinking_mode = "show"  # "show" | "hide" | "off"
+        self.search_enabled = False
+        self.http_client: Optional[httpx.AsyncClient] = None
+        self.session: Optional[PromptSession] = None
+
+    async def init(self):
+        self.http_client = httpx.AsyncClient(
+            timeout=settings.REQUEST_TIMEOUT,
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
+        provider_registry.init_providers(self.http_client)
+        self.session = PromptSession(
+            history=InMemoryHistory(),
+            auto_suggest=AutoSuggestFromHistory(),
+            completer=MultiProviderCommandCompleter(),
+            style=prompt_style,
+        )
+
+    async def close(self):
+        if self.http_client:
+            await self.http_client.aclose()
+
+    @property
+    def is_thinking_enabled(self) -> bool:
+        return self.thinking_mode in ["show", "hide"]
+
+    def get_active_session_id(self) -> Optional[str]:
+        try:
+            prov = provider_registry.get_provider(self.provider_id)
+            return prov.get_current_session_id() or session_manager.get_current_session_id()
+        except Exception:
+            return session_manager.get_current_session_id()
+
+    def get_bottom_toolbar(self):
+        prov_name = provider_registry.get_provider(self.provider_id).display_name
+        if self.thinking_mode == "show":
+            think_str = "🧠 Мысли: ПОКАЗАТЬ"
+        elif self.thinking_mode == "hide":
+            think_str = "🧠 Мысли: СКРЫТЬ"
+        else:
+            think_str = "🧠 Мысли: ВЫКЛ"
+
+        search_str = "🌐 Поиск: ВКЛ" if self.search_enabled else "🌐 Поиск: ВЫКЛ"
+        sid = self.get_active_session_id()
+        session_short = (sid[:8] + "...") if sid else "новая"
+        return f" [{prov_name}] | [Модель: {self.model}] | [{think_str}] | [{search_str}] | [Сессия: {session_short}] "
+
+    def print_banner(self):
+        banner = """
+[bold cyan]╔══════════════════════════════════════════════════════════════════╗
+║             Multi-LLM Reverse-Engineered Web CLI                 ║
+║       DeepSeek V4/R1       •       Qwen 3.7 Plus / 3.8           ║
+╚══════════════════════════════════════════════════════════════════╝[/bold cyan]
+        """
+        console.print(banner)
+        self.print_status()
+        console.print("[dim]Начните ввод сообщения или введите [bold]/[/bold] для вызова меню команд.[/dim]\n")
 
     def print_status(self):
         provider = provider_registry.get_provider(self.provider_id)
-        p_name = provider.display_name if provider else self.provider_id
-        auth_status = "[green]✓ Авторизован[/green]" if provider and provider.is_authenticated() else "[red]✗ Не авторизован[/red]"
+        is_auth = provider.is_authenticated()
+        auth_status = f"[green]✓ Авторизован ({provider.display_name})[/green]" if is_auth else f"[bold red]✗ Нет токена ({provider.display_name})[/bold red]"
+        session_id = self.get_active_session_id() or "[dim]не создана (будет создана при первом запросе)[/dim]"
 
-        status_text = (
-            f"[bold cyan]Провайдер:[/] [bold magenta]{p_name}[/] ({self.provider_id})\n"
-            f"[bold cyan]Модель:[/] [bold yellow]{self.model}[/]\n"
-            f"[bold cyan]Статус аккаунта:[/] {auth_status}\n"
-            f"[bold cyan]Мысли (Thinking):[/] {'[green]ВКЛ[/green]' if self.thinking_enabled else '[dim]ВЫКЛ[/dim]'}\n"
-            f"[bold cyan]Веб-поиск:[/] {'[green]ВКЛ[/green]' if self.search_enabled else '[dim]ВЫКЛ[/dim]'}\n"
-            f"[bold cyan]Стриминг:[/] {'[green]ВКЛ[/green]' if self.stream_mode else '[dim]ВЫКЛ[/dim]'}\n"
-            f"[bold cyan]Сессия:[/] [dim]{self.session_id or 'Новая (будет создана при первом запросе)'}[/dim]"
+        if self.thinking_mode == "show":
+            think_label = "[green]ВКЛ (показывать блок мыслей)[/green]"
+        elif self.thinking_mode == "hide":
+            think_label = "[yellow]ВКЛ (скрывать мысли)[/yellow]"
+        else:
+            think_label = "[dim]ВЫКЛ[/dim]"
+
+        tokens_info = []
+        for p in provider_registry.list_providers():
+            mark = "[green]✓[/green]" if p["authenticated"] else "[red]✗[/red]"
+            active_mark = " [bold cyan](активен)[/bold cyan]" if p["id"] == self.provider_id else ""
+            tokens_info.append(f"{mark} {p['name']}{active_mark}")
+
+        status_table = (
+            f"  • [bold]Провайдеры:[/bold] {' | '.join(tokens_info)}\n"
+            f"  • [bold]Текущий статус:[/bold] {auth_status}\n"
+            f"  • [bold]Выбранная модель:[/bold] [yellow]{self.model}[/yellow]\n"
+            f"  • [bold]Thinking / Рассуждения:[/bold] {think_label}\n"
+            f"  • [bold]Web Search:[/bold] {'[green]ВКЛ[/green]' if self.search_enabled else '[dim]ВЫКЛ[/dim]'}\n"
+            f"  • [bold]ID Сессии:[/bold] [cyan]{session_id}[/cyan]"
         )
-        console.print(Panel(status_text, title="[bold]Текущее состояние[/bold]", border_style="cyan"))
+        console.print(Panel(status_table, title="[bold]Панель состояния[/bold]", border_style="blue"))
 
     def print_help(self):
-        help_table = Table(title="Доступные команды CLI", border_style="blue", show_header=True)
-        help_table.add_column("Команда", style="bold yellow", width=22)
-        help_table.add_column("Описание", style="white")
+        help_text = """
+[bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
+  [bold yellow]/proxy[/bold yellow]                       - Перейти в режим Proxy-монитора (прослушка запросов от Cline/Roo)
+  [bold yellow]/login [deepseek|qwen][/bold yellow]    - Автоматический вход через окно браузера (без ручного копирования)
+  [bold yellow]/provider <deepseek|qwen>[/bold yellow] - Переключить активного провайдера
+  [bold yellow]/model <name>[/bold yellow]              - Переключить модель (v4-pro, qwen3.7-plus, qwen-3.8-coder и др.)
+  [bold yellow]/token [provider] <token>[/bold yellow]  - Установить Bearer токен вручную
+  [bold yellow]/think [show|hide|off][/bold yellow]   - Режим мыслей: показывать, скрывать или выключить
+  [bold yellow]/search [on|off][/bold yellow]           - Включить/выключить поиск в интернете
+  [bold yellow]/new[/bold yellow]                       - Начать новый чат (сбросить контекст диалога)
+  [bold yellow]/sessions[/bold yellow]                  - Список предыдущих сохраненных диалогов
+  [bold yellow]/session <ID>[/bold yellow]              - Переключиться на существующий диалог
+  [bold yellow]/status[/bold yellow]                    - Показать текущее состояние и статус токенов
+  [bold yellow]/clear[/bold yellow]                     - Очистить экран терминала
+  [bold yellow]/exit[/bold yellow] или [bold yellow]/quit[/bold yellow]            - Выйти из консоли
+        """
+        console.print(Panel(help_text, title="Справка", border_style="cyan"))
 
-        help_table.add_row("/switch <provider>", "Переключить активного провайдера ([bold cyan]deepseek[/bold cyan] или [bold cyan]qwen[/bold cyan])")
-        help_table.add_row("/model <name>", "Выбрать модель для генерации")
-        help_table.add_row("/models", "Показать список моделей текущего провайдера")
-        help_table.add_row("/proxy", "Перейти в режим Live Proxy Монитора (отслеживание запросов агентов)")
-        help_table.add_row("/login [provider]", "Автологин через браузер (deepseek / qwen)")
-        help_table.add_row("/token <p> <token>", "Вручную установить User Token для провайдера")
-        help_table.add_row("/status", "Показать текущую модель, сессию и токены")
-        help_table.add_row("/new", "Начать новый диалог (очистить историю сессии)")
-        help_table.add_row("/think", "Переключить режим рассуждений (Thinking)")
-        help_table.add_row("/search", "Переключить веб-поиск (Search)")
-        help_table.add_row("/stream", "Переключить режим стриминга ответа")
-        help_table.add_row("/exit, /quit", "Выйти из CLI")
+    async def start_background_server(self):
+        """Запускает FastAPI Proxy сервер в фоне внутри текущего event loop."""
+        if hasattr(self, "_server_task") and self._server_task and not self._server_task.done():
+            return
 
-        console.print(help_table)
-
-    def print_models(self):
-        provider = provider_registry.get_provider(self.provider_id)
-        p_name = provider.display_name if provider else self.provider_id
-        models = self.available_models.get(self.provider_id, [])
-
-        table = Table(title=f"Доступные модели для {p_name}", border_style="green")
-        table.add_column("ID модели", style="bold yellow")
-        table.add_column("Статус", style="cyan")
-
-        for m in models:
-            is_cur = " (активна)" if m == self.model else ""
-            table.add_row(m, f"[green]Доступна[/green]{is_cur}")
-
-        console.print(table)
-        console.print(f"[dim]Используйте: [bold]/model <ID>[/bold] для переключения[/dim]\n")
-
-    def run_server_in_background(self):
-        """Запускает FastAPI Proxy сервер в отдельном фоновом потоке."""
-        import threading
         import uvicorn
-        from app.main import app
+        from app.main import app as fastapi_app
 
-        def _run():
-            # Заглушаем избыточные uvicorn логи
-            uvicorn.run(
-                app,
-                host=settings.HOST,
-                port=settings.PORT,
-                log_level="error",
-                access_log=False,
-            )
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        time.sleep(0.5)
-
-    async def run_proxy_monitor(self):
-        """Интерактивный экран Proxy режима для отслеживания запросов агентов в реальном времени."""
-        console.clear()
-        provider = provider_registry.get_provider(self.provider_id)
-        p_name = provider.display_name if provider else self.provider_id
-
-        header_text = (
-            f"[bold green]⚡ РЕЖИМ ПРОКСИ-МОНИТОРА АКТИВИРОВАН[/bold green]\n"
-            f"[cyan]Адрес для подключения агентов (ZCode, Cline, Cursor, Roo):[/cyan] [bold yellow]http://127.0.0.1:{settings.PORT}/v1[/bold yellow]\n"
-            f"[cyan]Эндпоинт Anthropic (Claude Code):[/cyan] [bold yellow]http://127.0.0.1:{settings.PORT}/v1/messages[/bold yellow]\n"
-            f"[cyan]Провайдер по умолчанию:[/cyan] [bold magenta]{p_name}[/] | [dim]Любой входящий API-ключ принимается[/dim]\n"
-            f"[dim]Нажмите [bold red]Ctrl+C[/bold red] для возврата в интерактивный CLI чат.[/dim]"
+        config = uvicorn.Config(
+            fastapi_app,
+            host=settings.HOST,
+            port=settings.PORT,
+            log_level="warning",
+            access_log=False,
         )
-        console.print(Panel(header_text, border_style="green", expand=False))
-        console.print("[dim]Ожидание входящих вызовов от ваших агентов...[/dim]\n")
+        server = uvicorn.Server(config)
+        self._uvicorn_server = server
+        self._server_task = asyncio.create_task(server.serve())
+        await asyncio.sleep(0.6)
 
+    async def enter_proxy_mode(self):
+        """Запускает интерактивный инспектор запросов от внешних AI-агентов (Cline, Cursor, Roo)."""
+        console.print(f"[cyan]Инициализация Proxy-сервера на порту {settings.PORT}...[/cyan]")
+        await self.start_background_server()
+
+        proxy_banner = f"""
+[bold cyan]╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                   🛡️ РЕЖИМ PROXY: МОНИТОРИНГ И ЛОГИРОВАНИЕ ЗАПРОСОВ АГЕНТОВ                     ║
+║                                                                                                ║
+║  • OpenAI Endpoint:    [bold yellow]http://127.0.0.1:{settings.PORT}/v1/chat/completions[/bold yellow]                               ║
+║  • Anthropic Endpoint: [bold yellow]http://127.0.0.1:{settings.PORT}/v1/messages[/bold yellow]                                      ║
+║  • API Key:            [bold green]любая строка (например, 'deepseek' или 'qwen')[/bold green]                        ║
+║                                                                                                ║
+║  [bold]Настройки подключения для Cline / Roo Code / Cursor:[/bold]                                      ║
+║    API Provider: [yellow]OpenAI Compatible[/yellow] или [yellow]Anthropic[/yellow]                                         ║
+║    Base URL:     [yellow]http://127.0.0.1:{settings.PORT}/v1[/yellow]                                                    ║
+║    Model ID:     [yellow]deepseek-v4-pro[/yellow] | [yellow]deepseek-reasoner[/yellow] | [yellow]qwen-3.8-coder[/yellow]                          ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════╝[/bold cyan]
+[bold green]● Proxy-сервер активен и слушает входящие запросы.[/bold green]
+[dim]Для возврата в режим интерактивного диалога нажмите [bold]Ctrl+C[/bold].[/dim]
+"""
+        console.print(proxy_banner)
+
+        from app.services.proxy_logger import proxy_logger
         in_thinking = False
 
         def on_event(event: dict):
@@ -134,11 +289,11 @@ class DeepSeekCLI:
             if e_type == "request_start":
                 in_thinking = False
                 proto = event.get("protocol", "OpenAI")
-                ep = event.get("endpoint", "/v1/chat/completions")
+                ep = event.get("endpoint", "")
                 m = event.get("model", "")
                 p = event.get("provider", "")
-                msgs = event.get("messages_count", 0)
                 toks = event.get("tokens", 0)
+                msgs = event.get("messages_count", 0)
                 tools = event.get("tools", [])
                 t_str = f" | Tools ({len(tools)}): {', '.join(tools[:5])}{'...' if len(tools)>5 else ''}" if tools else " | Tools: нет"
                 t_now = event.get("time", "")
@@ -216,167 +371,275 @@ class DeepSeekCLI:
             )
             return
 
-        chat_req = DeepSeekChatRequest(
+        req = DeepSeekChatRequest(
             prompt=user_input,
-            chat_session_id=self.session_id,
+            chat_session_id=provider.get_current_session_id(),
             model=self.model,
-            thinking_enabled=self.thinking_enabled,
+            thinking_enabled=self.is_thinking_enabled,
             search_enabled=self.search_enabled,
-            stream=self.stream_mode,
+            stream=True,
         )
 
         in_thinking = False
-        full_content = []
+        in_content = False
+        tokens_count = 0
 
         try:
-            if self.stream_mode:
-                console.print(f"\n[dim]{provider.display_name} отвечает...[/dim]")
-                async for chunk in provider.stream_chat(chat_req):
-                    if chunk.session_id and not self.session_id:
-                        self.session_id = chunk.session_id
+            async for chunk in provider.stream_chat(req):
+                if chunk.session_id:
+                    provider.set_session_id(chunk.session_id)
 
-                    if chunk.type == "thinking":
+                if chunk.token_usage:
+                    tokens_count = chunk.token_usage
+
+                # Обработка блока рассуждений (Thinking)
+                if chunk.type == "thinking":
+                    if self.thinking_mode == "show":
                         if not in_thinking:
-                            sys.stdout.write("\033[90m🧠 Рассуждения:\n")
+                            console.print(f"\n[dim]╭─── 🧠 Рассуждения {provider.display_name} ─────────────────────────────────╮[/dim]")
+                            sys.stdout.write("\033[90m")
                             in_thinking = True
                         sys.stdout.write(chunk.text)
                         sys.stdout.flush()
-                    elif chunk.type == "content":
-                        if in_thinking:
-                            sys.stdout.write("\033[0m\n\n💬 Ответ:\n")
-                            in_thinking = False
-                        sys.stdout.write(chunk.text)
-                        sys.stdout.flush()
-                        full_content.append(chunk.text)
+                    elif self.thinking_mode == "hide":
+                        if not in_thinking:
+                            sys.stdout.write(f"\r\033[90m🧠 {provider.display_name} рассуждает...\033[0m")
+                            sys.stdout.flush()
+                            in_thinking = True
 
-                if in_thinking:
-                    sys.stdout.write("\033[0m\n")
-                sys.stdout.write("\n\n")
-            else:
-                with console.status(f"[bold green]{provider.display_name} думает...", spinner="dots"):
-                    resp = await provider.send_message(chat_req)
+                # Обработка основного ответа (Content)
+                elif chunk.type == "content":
+                    if in_thinking:
+                        if self.thinking_mode == "show":
+                            sys.stdout.write("\033[0m\n")
+                            console.print("[dim]╰───────────────────────────────────────────────────────────────────────╯[/dim]\n")
+                        elif self.thinking_mode == "hide":
+                            sys.stdout.write("\r\033[K")
+                            sys.stdout.flush()
+                        in_thinking = False
 
-                if resp.session_id and not self.session_id:
-                    self.session_id = resp.session_id
+                    if not in_content:
+                        console.print(f"[bold cyan]{provider.display_name}:[/bold cyan]")
+                        in_content = True
 
-                if resp.thinking:
-                    console.print(Panel(resp.thinking, title="🧠 Рассуждения", border_style="dim"))
-                console.print(Panel(resp.content, title=f"💬 {provider.display_name}", border_style="green"))
+                    sys.stdout.write(chunk.text)
+                    sys.stdout.flush()
+
+            if in_thinking and self.thinking_mode == "show":
+                sys.stdout.write("\033[0m\n")
+                console.print("[dim]╰───────────────────────────────────────────────────────────────────────╯[/dim]")
+
+            print("\n", flush=True)
+
+            sid = provider.get_current_session_id() or session_manager.get_current_session_id() or "новая"
+            info_str = f"[dim]Провайдер: {provider.display_name} | Модель: {self.model} | Сессия: {sid} | Использовано токенов: {tokens_count or 'N/A'}[/dim]\n"
+            console.print(info_str)
 
         except Exception as e:
-            console.print(f"[bold red]Ошибка генерации:[/] {e}")
+            console.print(f"\n[bold red]Ошибка выполнения запроса:[/bold red] {e}\n")
 
-    async def run(self):
-        print_welcome_banner()
-        self.print_status()
+    async def run(self, auto_proxy: bool = False):
+        await self.init()
+        self.print_banner()
 
-        # Автоматический запуск сервера в фоне
-        self.run_server_in_background()
-        console.print(f"[dim]Фоновый API-сервер запущен на [bold yellow]http://{settings.HOST}:{settings.PORT}[/bold yellow][/dim]")
-        console.print("[dim]Введите [bold]/help[/bold] для справки или [bold]/proxy[/bold] для мониторинга агентов.[/dim]\n")
+        if auto_proxy:
+            await self.enter_proxy_mode()
 
         while True:
             try:
-                user_input = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: input(f"[{self.provider_id}:{self.model}] > ").strip()
+                user_input = await self.session.prompt_async(
+                    [("class:prompt", "Вы > ")],
+                    bottom_toolbar=self.get_bottom_toolbar,
                 )
-
+                user_input = user_input.strip()
                 if not user_input:
                     continue
 
                 if user_input.startswith("/"):
-                    cmd_parts = user_input.split()
-                    cmd = cmd_parts[0].lower()
+                    parts = user_input.split(maxsplit=1)
+                    cmd = parts[0].lower()
+                    arg = parts[1].strip() if len(parts) > 1 else ""
 
-                    if cmd in ["/exit", "/quit"]:
-                        console.print("[yellow]До свидания![/yellow]")
+                    if cmd in ["/exit", "/quit", "/q"]:
+                        console.print("[cyan]До встречи![/cyan]")
                         break
-
                     elif cmd == "/help":
                         self.print_help()
-
                     elif cmd == "/status":
                         self.print_status()
-
-                    elif cmd == "/switch":
-                        if len(cmd_parts) > 1:
-                            self.set_provider_and_default_model(cmd_parts[1])
-                        else:
-                            console.print("[yellow]Использование: /switch <deepseek|qwen>[/yellow]")
-
-                    elif cmd == "/models":
-                        self.print_models()
-
-                    elif cmd == "/model":
-                        if len(cmd_parts) > 1:
-                            target_model = cmd_parts[1]
-                            # Автоматически определяем провайдера для выбранной модели
-                            resolved_p = provider_registry.resolve_provider_for_model(target_model)
-                            self.provider_id = resolved_p.provider_id
-                            self.model = target_model
-                            console.print(f"[green]✓ Выбрана модель:[/] [yellow]{self.model}[/] (Провайдер: [magenta]{resolved_p.display_name}[/])")
-                        else:
-                            console.print("[yellow]Использование: /model <название модели>[/yellow]")
-
-                    elif cmd == "/proxy":
-                        await self.run_proxy_monitor()
-
-                    elif cmd == "/new":
-                        self.session_id = None
-                        provider = provider_registry.get_provider(self.provider_id)
-                        if provider:
-                            provider.reset_session()
-                        console.print("[green]✓ Сессия сброшена. Начат новый диалог.[/green]")
-
-                    elif cmd == "/think":
-                        self.thinking_enabled = not self.thinking_enabled
-                        console.print(f"Режим рассуждений (Thinking): {'[green]ВКЛ[/green]' if self.thinking_enabled else '[red]ВЫКЛ[/red]'}")
-
-                    elif cmd == "/search":
-                        self.search_enabled = not self.search_enabled
-                        console.print(f"Веб-поиск (Search): {'[green]ВКЛ[/green]' if self.search_enabled else '[red]ВЫКЛ[/red]'}")
-
-                    elif cmd == "/stream":
-                        self.stream_mode = not self.stream_mode
-                        console.print(f"Режим стриминга: {'[green]ВКЛ[/green]' if self.stream_mode else '[red]ВЫКЛ[/red]'}")
-
+                    elif cmd == "/clear":
+                        os.system("cls" if os.name == "nt" else "clear")
+                        self.print_banner()
+                    elif cmd in ["/proxy", "/server"]:
+                        await self.enter_proxy_mode()
                     elif cmd == "/login":
-                        target_p = cmd_parts[1].lower() if len(cmd_parts) > 1 else self.provider_id
-                        from app.services.browser_login import browser_login_service
-                        console.print(f"[cyan]Запуск браузера для автологина в {target_p}...[/cyan]")
-                        token = await browser_login_service.login(provider_id=target_p)
-                        if token:
-                            credentials_manager.set_token(target_p, token)
-                            console.print(f"[bold green]✓ Автологин для {target_p} успешен! Токен сохранен.[/bold green]")
+                        target_p = arg.lower().strip() if arg else self.provider_id
+                        if target_p not in ["deepseek", "qwen"]:
+                            target_p = self.provider_id
+                        console.print(f"\n[bold cyan]🌐 Запуск браузера Chrome для авторизации в {target_p.upper()}...[/bold cyan]")
+                        console.print("[dim]Войдите в аккаунт в открывшемся окне браузера. Токен будет перехвачен и сохранен автоматически.[/dim]\n")
+                        from app.services.browser_auth import extract_token_via_browser
+                        tok = await extract_token_via_browser(provider=target_p, headless=False, timeout_seconds=120)
+                        if tok:
+                            console.print(f"\n[bold green]✓ Токен для {target_p} успешно перехвачен и сохранен в credentials.json![/bold green]\n")
                         else:
-                            console.print(f"[bold red]✗ Не удалось перехватить токен для {target_p}.[/bold red]")
-
+                            console.print(f"\n[bold red]✗ Не удалось извлечь токен (таймаут или окно было закрыто).[/bold red]\n")
+                        self.print_status()
+                    elif cmd == "/provider":
+                        if not arg:
+                            console.print("[yellow]Использование:[/yellow] /provider <deepseek | qwen>")
+                        else:
+                            self.set_provider_and_default_model(arg)
+                        self.print_status()
                     elif cmd == "/token":
-                        if len(cmd_parts) >= 3:
-                            p_id = cmd_parts[1].lower()
-                            tok = cmd_parts[2]
-                            credentials_manager.set_token(p_id, tok)
-                            console.print(f"[green]✓ Токен для {p_id} сохранен.[/green]")
+                        token_parts = arg.split(maxsplit=1)
+                        if len(token_parts) == 0 or not token_parts[0]:
+                            console.print("[red]Использование:[/red] /token <токен> ИЛИ /token <provider> <токен>")
+                        elif len(token_parts) == 1:
+                            credentials_manager.save(token_parts[0], provider=self.provider_id)
+                            console.print(f"[green]✓ Токен для {self.provider_id} успешно сохранен![/green]")
+                            self.print_status()
                         else:
-                            console.print("[yellow]Использование: /token <deepseek|qwen> <UserToken>[/yellow]")
-
+                            p_name, p_tok = token_parts[0].lower(), token_parts[1]
+                            credentials_manager.save(p_tok, provider=p_name)
+                            console.print(f"[green]✓ Токен для {p_name} успешно сохранен![/green]")
+                            self.print_status()
+                    elif cmd == "/new":
+                        session_manager.reset_context()
+                        try:
+                            cur_p = provider_registry.get_provider(self.provider_id)
+                            cur_p.reset_session()
+                        except Exception:
+                            pass
+                        console.print("[green]✓ Начат новый диалог. Контекст сброшен.[/green]")
+                        self.print_status()
+                    elif cmd == "/sessions":
+                        try:
+                            cur_p = provider_registry.get_provider(self.provider_id)
+                            sessions_list = await cur_p.list_sessions()
+                            if not sessions_list:
+                                console.print(f"[yellow]У провайдера {cur_p.display_name} нет сохраненных сессий или не удалось их получить.[/yellow]")
+                            else:
+                                console.print(f"\n[bold cyan]Список диалогов ({cur_p.display_name}):[/bold cyan]")
+                                for idx, s in enumerate(sessions_list[:15], 1):
+                                    s_id = s.get("id", "")
+                                    s_title = s.get("title", "Без названия")
+                                    is_curr = " [green](текущий)[/green]" if s_id == cur_p.get_current_session_id() else ""
+                                    console.print(f"  {idx}. [yellow]{s_id}[/yellow] — [bold]{s_title}[/bold]{is_curr}")
+                                console.print("[dim]Для переключения введите:[/dim] [bold yellow]/session <ID>[/bold yellow]\n")
+                        except Exception as e:
+                            console.print(f"[red]Ошибка при получении сессий:[/red] {e}")
+                    elif cmd == "/session":
+                        if not arg:
+                            console.print("[yellow]Использование:[/yellow] /session <ID_сессии>")
+                        else:
+                            try:
+                                cur_p = provider_registry.get_provider(self.provider_id)
+                                cur_p.set_session_id(arg)
+                                console.print(f"[green]✓ Переключено на сессию {arg} ({cur_p.display_name})[/green]")
+                                self.print_status()
+                            except Exception as e:
+                                console.print(f"[red]Ошибка переключения сессии:[/red] {e}")
+                    elif cmd == "/think":
+                        arg_lower = arg.lower()
+                        if arg_lower in ["show", "on"]:
+                            self.thinking_mode = "show"
+                            console.print("[green]✓ Режим рассуждений: мысли отображаются в отдельном блоке[/green]")
+                        elif arg_lower in ["hide", "hidden"]:
+                            self.thinking_mode = "hide"
+                            console.print("[yellow]✓ Режим рассуждений: мысли скрыты (только финальный ответ)[/yellow]")
+                        elif arg_lower == "off":
+                            self.thinking_mode = "off"
+                            console.print("[yellow]✓ Режим рассуждений ВЫКЛЮЧЕН[/yellow]")
+                        else:
+                            if self.thinking_mode == "off":
+                                self.thinking_mode = "show"
+                            elif self.thinking_mode == "show":
+                                self.thinking_mode = "hide"
+                            else:
+                                self.thinking_mode = "off"
+                        self.print_status()
+                    elif cmd == "/search":
+                        if arg.lower() == "on":
+                            self.search_enabled = True
+                            console.print("[green]✓ Веб-поиск ВКЛЮЧЕН[/green]")
+                        elif arg.lower() == "off":
+                            self.search_enabled = False
+                            console.print("[yellow]✓ Веб-поиск ВЫКЛЮЧЕН[/yellow]")
+                        else:
+                            self.search_enabled = not self.search_enabled
+                            console.print(f"Веб-поиск: {'[green]ВКЛ[/green]' if self.search_enabled else '[dim]ВЫКЛ[/dim]'}")
+                        self.print_status()
+                    elif cmd == "/model":
+                        arg_clean = arg.lower().strip()
+                        if not arg_clean:
+                            console.print(f"[cyan]Текущая модель:[/cyan] {self.model}")
+                        else:
+                            # Автоматически определяем провайдера для выбранной модели
+                            target_provider = provider_registry.resolve_provider_for_model(arg_clean)
+                            self.provider_id = target_provider.provider_id
+                            self.model = arg_clean
+                            console.print(f"[green]✓ Выбрана модель: {self.model} (Провайдер: {target_provider.display_name})[/green]")
+                        self.print_status()
                     else:
-                        console.print(f"[red]Неизвестная команда:[/] {cmd}. Введите [bold]/help[/bold] для списка.")
+                        console.print(f"[red]Неизвестная команда:[/red] {cmd}. Введите [bold]/help[/bold].")
+                    continue
 
-                else:
-                    await self.handle_chat(user_input)
+                await self.handle_chat(user_input)
 
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]До свидания![/yellow]")
+                console.print("\n[cyan]Сессия завершена.[/cyan]")
                 break
+
+        await self.close()
 
 
 def main():
-    cli = DeepSeekCLI()
-    try:
-        asyncio.run(cli.run())
-    except KeyboardInterrupt:
-        pass
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="DeepSeek & Qwen Free API CLI & Proxy",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--proxy", "-p",
+        action="store_true",
+        help="Сразу запустить режим Proxy-монитора (для ZCode, Cline, Cursor, Roo Code)",
+    )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default=None,
+        choices=["deepseek", "qwen"],
+        help="Выбрать провайдера по умолчанию (deepseek или qwen)",
+    )
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        default=None,
+        help="Выбрать модель по умолчанию (например, deepseek-v4-pro, qwen-3.8-coder)",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default=None,
+        help="Команда быстрого запуска (например, 'proxy' или 'server')",
+    )
+
+    args = parser.parse_args()
+
+    cli = MultiProviderCLI()
+
+    auto_proxy = args.proxy or (bool(args.command) and args.command.lower() in ["proxy", "server", "/proxy", "/server"])
+
+    if args.provider:
+        cli.set_provider_and_default_model(args.provider)
+    if args.model:
+        target_provider = provider_registry.resolve_provider_for_model(args.model)
+        cli.provider_id = target_provider.provider_id
+        cli.model = args.model
+
+    asyncio.run(cli.run(auto_proxy=auto_proxy))
 
 
 if __name__ == "__main__":
