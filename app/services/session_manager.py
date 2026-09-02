@@ -8,9 +8,13 @@ logger = logging.getLogger(__name__)
 
 
 class SessionManager:
+    """Управляет жизненным циклом чат-сессий DeepSeek и отслеживает контекст (parent_message_id)."""
+
     def __init__(self):
         self._current_session_id: Optional[str] = None
+        # Сопоставление session_id -> last_message_id (для сохранения контекста диалога)
         self._last_message_ids: Dict[str, Optional[int]] = {}
+        # Заголовки чатов
         self._session_titles: Dict[str, str] = {}
 
     def get_current_session_id(self) -> Optional[str]:
@@ -30,6 +34,7 @@ class SessionManager:
             self._session_titles[session_id] = title
 
     async def create_new_session(self, client: httpx.AsyncClient) -> str:
+        """Создает новую сессию через веб-API DeepSeek."""
         url = f"{settings.DEEPSEEK_BASE_URL}/api/v0/chat_session/create"
         headers = {
             "accept": "*/*",
@@ -70,17 +75,21 @@ class SessionManager:
         return session_id
 
     async def get_or_create_session(self, client: httpx.AsyncClient, session_id: Optional[str] = None) -> str:
+        """
+        Возвращает указанный session_id или создает новую чистую сессию для stateless запросов.
+        Если session_id не указан (stateless запросы от внешних агентов ZCode/Cline/Cursor),
+        всегда создается чистая новая сессия, чтобы полный контекст диалога (messages),
+        который агент передает в каждом запросе, не накапливался квадратично на сервере DeepSeek.
+        """
         if session_id:
             if session_id not in self._last_message_ids:
                 self._last_message_ids[session_id] = None
             return session_id
 
-        if self._current_session_id:
-            return self._current_session_id
-
         return await self.create_new_session(client)
 
     def reset_context(self) -> None:
+        """Сбрасывает текущую активную сессию (для начала чистого диалога)."""
         self._current_session_id = None
 
 
