@@ -41,6 +41,7 @@ CRITICAL REQUIREMENT:
 - When the user asks you to create, write, edit, replace, or modify files, or execute commands, you MUST NOT merely output code or commands in markdown.
 - You MUST invoke the appropriate tool using a `<tool_call>` block with a valid JSON object containing `"name"` and `"arguments"`.
 - DIRECT TOOL EXECUTION: When performing file operations (reading, writing, editing, listing, or searching files) or terminal commands, invoke the direct tool (such as Read, Write, Edit, Bash, Glob, Grep) directly. Do NOT delegate file operations to subagent tools (like `Agent` or `Task`).
+- PURE JSON FORMAT: Output clean, strictly valid JSON inside `<tool_call>`. Never output XML parameter tags (such as `<parameter=...>` or `</parameter>`).
 
 Example format:
 <tool_call>

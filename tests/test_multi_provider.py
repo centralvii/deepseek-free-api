@@ -182,3 +182,22 @@ def test_multiple_json_in_single_tool_call_tag():
     assert "ls -la" in calls[1].function.arguments
     assert clean_text == "Изучу структуру проекта и текущий парсер курсов."
     assert "<tool_call>" not in clean_text
+
+
+def test_hybrid_qwen_parameter_tags_extraction():
+    """Тестирует парсинг вызовов инструментов, где Qwen подмешивает теги <parameter=key> и </parameter>."""
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """
+<tool_call>
+{"name": "Bash", "arguments": {"command": "find /e/vibecoding/stepik-searcher -type f -name \\"*.py\\" -o -name \\"*.js\\" -o -name \\"*.ts\\" -o -name \\"*.json\\" | head -50
+</parameter>
+<parameter=description> "List project files to understand structure"}}
+</tool_call>
+"""
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 1
+    assert calls[0].function.name == "Bash"
+    assert "find /e/vibecoding" in calls[0].function.arguments
+    assert "List project files to understand structure" in calls[0].function.arguments
+    assert "<parameter" not in clean_text

@@ -34,6 +34,7 @@ CRITICAL REQUIREMENT:
 - When the user asks you to create, write, edit, replace, or modify files, or execute commands, you MUST NOT merely output code or commands in markdown.
 - You MUST invoke the appropriate tool using a `<tool_call>` block with a valid JSON object containing `"name"` and `"arguments"`.
 - DIRECT TOOL EXECUTION: When performing file operations (reading, writing, editing, listing, or searching files) or terminal commands, invoke the direct tool (such as Read, Write, Edit, Bash, Glob, Grep) directly. Do NOT delegate file operations to subagent tools (like `Agent` or `Task`).
+- PURE JSON FORMAT: Output clean, strictly valid JSON inside `<tool_call>`. Never output XML parameter tags (such as `<parameter=...>` or `</parameter>`).
 
 Example format:
 <tool_call>
@@ -110,13 +111,26 @@ def format_messages_to_prompt(
     return full_prompt
 
 
+def normalize_qwen_parameter_tags(text: str) -> str:
+    """Нормализует гибридные теги параметров Qwen (<parameter=key>...</parameter>) в валидный JSON."""
+    if not text or "parameter" not in text:
+        return text
+    # 1. Замена перехода между параметрами: </parameter>\n<parameter=key> -> ", "key": 
+    normalized = re.sub(r'\s*</parameter>\s*<parameter=([a-zA-Z0-9_\-]+)>\s*', r'", "\1": ', text)
+    # 2. Замена одиночного </parameter> -> "
+    normalized = re.sub(r'\s*</parameter>', r'"', normalized)
+    # 3. Замена одиночного <parameter=key> -> "key": 
+    normalized = re.sub(r'<parameter=([a-zA-Z0-9_\-]+)>\s*', r'"\1": ', normalized)
+    return normalized
+
+
 def _parse_all_tool_json(raw_json: str) -> List[Tuple[str, str]]:
     """Парсит все JSON-объекты (один или несколько параллельных) из блока tool_call."""
     results: List[Tuple[str, str]] = []
     if not raw_json:
         return results
 
-    s = raw_json.strip()
+    s = normalize_qwen_parameter_tags(raw_json.strip())
     decoder = json.JSONDecoder(strict=False)
     idx = 0
     while idx < len(s):
@@ -174,6 +188,7 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     """
     Извлекает вызовы инструментов из ответа модели:
     - Поддерживает один или несколько JSON-объектов внутри одного тега <tool_call>...</tool_call>.
+    - Поддерживает гибридные теги параметров Qwen (<parameter=key>...</parameter>).
     - Поддерживает теги <tool_call>...</tool_call> (включая <tool_call"> и с атрибутами).
     - Поддерживает markdown блоки ```tool_call...```.
     - Поддерживает нативный формат Qwen <function=name>...</function>.
@@ -214,11 +229,19 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     for match in re.finditer(func_pat, text, re.DOTALL):
         name = match.group(1).strip()
         raw_args = match.group(2).strip()
-        try:
-            args_obj = json.loads(raw_args, strict=False)
-            args_str = json.dumps(args_obj, ensure_ascii=False) if isinstance(args_obj, dict) else str(args_obj)
-        except Exception:
-            args_str = raw_args
+        args_str = raw_args
+        if "<parameter" in raw_args:
+            param_dict = {}
+            for p in re.finditer(r'<parameter=([a-zA-Z0-9_\-]+)>\s*(.*?)\s*(?:</parameter>|$)', raw_args, re.DOTALL):
+                param_dict[p.group(1)] = p.group(2).strip().strip("\"'")
+            if param_dict:
+                args_str = json.dumps(param_dict, ensure_ascii=False)
+        else:
+            try:
+                args_obj = json.loads(raw_args, strict=False)
+                args_str = json.dumps(args_obj, ensure_ascii=False) if isinstance(args_obj, dict) else str(args_obj)
+            except Exception:
+                args_str = raw_args
 
         call_key = (name, args_str)
         if call_key not in seen_calls:
