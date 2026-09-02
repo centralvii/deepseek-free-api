@@ -1,43 +1,43 @@
 import json
+import logging
 import re
-import uuid
-from typing import List, Optional, Tuple, Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
+
 from app.schemas.openai import OpenAIChatMessage, OpenAITool, OpenAIToolCall, OpenAIToolCallFunction
 
+logger = logging.getLogger(__name__)
 
-def compact_tool_schema(value: Any, is_root: bool = True) -> Any:
+
+def compact_tool_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Компактизирует JSON Schema параметров инструмента:
-    - Удаляет избыточные метаданные (title, $comment, verbose examples).
-    - Сохраняет валидационную структуру (type, properties, required, enum, const, items).
-    - Сокращает чрезмерно длинные описания параметров (>120 симв.).
+    Компактизирует JSON Schema инструмента для экономии токенов и лимита WAF.
+    - Удаляет шумные метаданные (title, $comment, verbose descriptions)
+    - Сокращает длинные описания параметров до 120 символов
+    - Сохраняет критические ключи (type, properties, required, items, enum, const)
     """
-    if isinstance(value, list):
-        return [compact_tool_schema(item, is_root=False) for item in value]
-    if not isinstance(value, dict):
-        return value
+    if not isinstance(schema, dict):
+        return schema
 
     compact = {}
-    for k, v in value.items():
-        if not is_root and k in {"title", "$comment"}:
+    for k, v in schema.items():
+        if k in ("title", "$comment", "$schema", "default"):
             continue
-        if not is_root and k == "description" and isinstance(v, str) and len(v) > 120:
+        if k == "description" and isinstance(v, str) and len(v) > 120:
             compact[k] = v[:117] + "..."
-            continue
-
-        if k in {"properties", "patternProperties", "definitions", "$defs"} and isinstance(v, dict):
-            compact[k] = {pk: compact_tool_schema(pv, is_root=False) for pk, pv in v.items()}
-        elif k in {"items", "additionalProperties", "contains"} and isinstance(v, dict):
-            compact[k] = compact_tool_schema(v, is_root=False)
-        elif k in {"anyOf", "allOf", "oneOf", "prefixItems"} and isinstance(v, list):
-            compact[k] = [compact_tool_schema(item, is_root=False) for item in v]
+        elif k == "properties" and isinstance(v, dict):
+            compact[k] = {
+                prop_name: compact_tool_schema(prop_def)
+                for prop_name, prop_def in v.items()
+            }
+        elif k == "items" and isinstance(v, dict):
+            compact[k] = compact_tool_schema(v)
         else:
             compact[k] = v
     return compact
 
 
 def build_tool_system_prompt(tools: List[OpenAITool]) -> str:
-    """Формирует системную инструкцию с описанием доступных инструментов (JSON Schema)."""
+    """Формирует системную инструкцию с описанием доступных инструментов."""
     raw_schema_chars = sum(
         len(json.dumps(tool.function.parameters or {}))
         for tool in tools
@@ -45,43 +45,33 @@ def build_tool_system_prompt(tools: List[OpenAITool]) -> str:
     )
     should_compact = raw_schema_chars > 12_000 or len(tools) > 15
 
-    tools_definitions = []
+    tool_lines = []
     for tool in tools:
         if tool.type == "function" and tool.function:
             fn_name = tool.function.name
-            desc = str(tool.function.description or "").strip()
-            if len(desc) > 350:
-                desc = desc[:347] + "..."
+            desc = str(tool.function.description or "").strip().replace("\r\n", " ")
+            if len(desc) > 300:
+                desc = desc[:297] + "..."
             params = tool.function.parameters or {"type": "object", "properties": {}}
             if should_compact:
                 params = compact_tool_schema(params)
+            params_str = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+            tool_lines.append(f"## {fn_name}\nDescription: {desc}\nParameters: {params_str}")
 
-            tools_definitions.append({
-                "type": "function",
-                "function": {
-                    "name": fn_name,
-                    "description": desc,
-                    "parameters": params,
-                }
-            })
-
-    tools_json = json.dumps(tools_definitions, ensure_ascii=False, separators=(",", ":"))
+    tools_text = "\n\n".join(tool_lines)
 
     prompt = f"""
 # Available Tools
 You have access to the following functions/tools to assist the user:
 
-```json
-{tools_json}
-```
+{tools_text}
 
 # Tool Call Instructions
-CRITICAL RULES:
+CRITICAL RULES FOR TOOL CALLS:
 1. You ONLY REASON and REQUEST tool executions. You do NOT execute any commands or files yourself.
-2. When performing actions (reading, writing, editing files, searching, running terminal commands), REQUEST the tool call.
+2. DO NOT STOP with just a text promise or declaration of intent (such as "Изучу файлы...", "I will check...", "Let me read..."). When you need to inspect, read, search, edit, or run something, you MUST output the tool call in the SAME response!
 3. NEVER simulate, guess, or fabricate command or tool output — output the tool call and wait for the actual result from the system.
-4. When requesting a tool, output ONLY the tool call. Do NOT add explanation, text, or markdown before or after the tool call.
-5. PURE JSON FORMAT: Output strictly valid JSON inside `<tool_call>...</tool_call>`:
+4. When requesting a tool, output valid JSON inside `<tool_call>...</tool_call>`:
 <tool_call>
 {{"name": "<function_name>", "arguments": {{...}}}}
 </tool_call>
@@ -89,7 +79,7 @@ CRITICAL RULES:
 Alternatively, standard JSON format is also accepted:
 {{"tool_call": {{"name": "<function_name>", "arguments": {{...}}}}}}
 
-If no tool call is needed, provide your normal conversational response directly.
+5. If no tool call is needed and the entire task is complete, provide your normal conversational response directly.
 """
     return prompt.strip()
 
@@ -153,6 +143,13 @@ def format_messages_to_prompt(
     if history_messages:
         prompt_parts.append("\nConversation History:\n" + "\n".join(history_messages))
 
+    # 3. Если последнее сообщение — вывод инструмента (tool output),
+    # добавляем директиву немедленно продолжить и вызвать инструмент, а не останавливаться на обещании
+    if compressed_messages and compressed_messages[-1].role in ["tool", "function"]:
+        prompt_parts.append(
+            "\n[System Directive: The previous tool execution has finished and its output is provided above. Proceed with the task immediately. If you need to inspect more files or run commands, invoke the tool call NOW: <tool_call>{\"name\": \"...\", \"arguments\": {...}}</tool_call>. Do NOT stop with only a conversational promise or intent.]"
+        )
+
     full_prompt = "\n\n".join(prompt_parts)
     if max_tokens:
         full_prompt = context_compressor.compress_raw_prompt(full_prompt, max_tokens=max_tokens)
@@ -163,362 +160,237 @@ def normalize_qwen_parameter_tags(text: str) -> str:
     """Нормализует гибридные теги параметров Qwen (<parameter=key>...</parameter>) в валидный JSON."""
     if not text or "parameter" not in text:
         return text
-    # 1. Замена перехода между параметрами: </parameter>\n<parameter=key> -> ", "key": 
-    normalized = re.sub(r'\s*</parameter>\s*<parameter=([a-zA-Z0-9_\-]+)>\s*', r'", "\1": ', text)
-    # 2. Замена одиночного </parameter> -> "
-    normalized = re.sub(r'\s*</parameter>', r'"', normalized)
-    # 3. Замена одиночного <parameter=key> -> "key": 
-    normalized = re.sub(r'<parameter=([a-zA-Z0-9_\-]+)>\s*', r'"\1": ', normalized)
+
+    pattern = r'<parameter=([a-zA-Z0-9_]+)>\s*([\s\S]*?)\s*</parameter>'
+
+    def _replace_param(match):
+        param_name = match.group(1)
+        val = match.group(2).strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith('{') and val.endswith('}')) or (val.startswith('[') and val.endswith(']')):
+            return f'"{param_name}": {val},'
+        elif val.lower() in ("true", "false", "null") or val.isdigit():
+            return f'"{param_name}": {val},'
+        else:
+            safe_val = json.dumps(val, ensure_ascii=False)
+            return f'"{param_name}": {safe_val},'
+
+    normalized = re.sub(pattern, _replace_param, text)
     return normalized
 
 
-def _parse_broken_arguments(args_str: str) -> Dict[str, Any]:
-    """
-    Устойчивый парсер аргументов инструмента:
-    - Восстанавливает JSON с неэкранированными внутренними кавычками (например, внутри shell-команд: echo "...", grep '...').
-    - Извлекает ключи и значения через позиционный сплит пар.
-    """
-    s = args_str.strip()
-    if s.startswith("{") and s.endswith("}"):
-        s = s[1:-1].strip()
+def repair_json_argument_strings(raw_json_str: str) -> str:
+    """Исправляет распространенные ошибки экранирования кавычек внутри полей аргументов."""
+    match = re.search(r'("command"|"content"|"text")\s*:\s*"(.*)"\s*,\s*"description"', raw_json_str, re.DOTALL)
+    if match:
+        field_name = match.group(1)
+        inner_content = match.group(2)
+        escaped_content = inner_content.replace('\\"', '"').replace('"', '\\"')
+        repaired = raw_json_str[:match.start(2)] + escaped_content + raw_json_str[match.end(2):]
+        return repaired
+    return raw_json_str
 
+
+def parse_tool_call_json(json_str: str) -> Optional[Tuple[str, str]]:
+    """Пытается распарсить JSON строку вызова инструмента."""
+    json_str = json_str.strip()
+    if not json_str:
+        return None
+
+    if json_str.startswith("```json"):
+        json_str = json_str[7:]
+    elif json_str.startswith("```"):
+        json_str = json_str[3:]
+    if json_str.endswith("```"):
+        json_str = json_str[:-3]
+    json_str = json_str.strip()
+
+    data = None
     try:
-        data = json.loads(args_str, strict=False)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-
-    key_pat = re.compile(r'"([a-zA-Z0-9_\-]+)"\s*:\s*')
-    matches = list(key_pat.finditer(s))
-    if not matches:
-        return {}
-
-    result = {}
-    for i in range(len(matches)):
-        key = matches[i].group(1)
-        val_start = matches[i].end()
-        val_end = matches[i + 1].start() if i + 1 < len(matches) else len(s)
-
-        raw_val = s[val_start:val_end].strip()
-        if raw_val.endswith(","):
-            raw_val = raw_val[:-1].strip()
-        if raw_val.startswith('"') and raw_val.endswith('"') and len(raw_val) >= 2:
-            raw_val = raw_val[1:-1]
-        elif raw_val.startswith('"'):
-            raw_val = raw_val[1:]
-        elif raw_val.endswith('"'):
-            raw_val = raw_val[:-1]
-
-        if (raw_val.startswith("{") and raw_val.endswith("}")) or (raw_val.startswith("[") and raw_val.endswith("]")):
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        json_str_norm = normalize_qwen_parameter_tags(json_str)
+        try:
+            data = json.loads(json_str_norm)
+        except json.JSONDecodeError:
+            repaired_str = repair_json_argument_strings(json_str_norm)
             try:
-                raw_val = json.loads(raw_val)
-            except Exception:
+                data = json.loads(repaired_str)
+            except json.JSONDecodeError:
                 pass
 
-        result[key] = raw_val
+    if isinstance(data, dict):
+        if "tool_call" in data and isinstance(data["tool_call"], dict):
+            data = data["tool_call"]
 
-    return result
-
-
-def _parse_all_tool_json(raw_json: str) -> List[Tuple[str, str]]:
-    """Парсит все JSON-объекты (один или несколько параллельных) из блока tool_call."""
-    results: List[Tuple[str, str]] = []
-    if not raw_json:
-        return results
-
-    s = normalize_qwen_parameter_tags(raw_json.strip())
-    decoder = json.JSONDecoder(strict=False)
-    idx = 0
-    while idx < len(s):
-        while idx < len(s) and s[idx].isspace():
-            idx += 1
-        if idx >= len(s):
-            break
-        try:
-            obj, end_idx = decoder.raw_decode(s, idx)
-            if isinstance(obj, dict):
-                name = obj.get("name") or obj.get("function")
-                args = obj.get("arguments") or obj.get("parameters") or obj.get("input", {})
-                if name:
-                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-                    results.append((str(name).strip(), args_str))
-            idx = end_idx
-        except Exception:
-            next_brace = s.find('{', idx + 1)
-            if next_brace != -1:
-                idx = next_brace
+        if "name" in data and ("arguments" in data or "parameters" in data):
+            fn_name = data.get("name")
+            args = data.get("arguments", data.get("parameters", {}))
+            if isinstance(args, dict):
+                args_str = json.dumps(args, ensure_ascii=False)
+            elif isinstance(args, str):
+                args_str = args
             else:
-                break
+                args_str = "{}"
+            return str(fn_name), args_str
 
-    # Fallback 1: стандартный json.loads
-    if not results:
-        try:
-            data = json.loads(s, strict=False)
-            if isinstance(data, dict):
-                name = data.get("name") or data.get("function")
-                args = data.get("arguments") or data.get("parameters") or data.get("input", {})
-                if name:
-                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-                    results.append((str(name).strip(), args_str))
-        except Exception:
-            pass
-
-    # Fallback 2: экранируем сырые переносы строк
-    if not results:
-        try:
-            sanitized = re.sub(r'[\r\n]+', '\\n', s)
-            data = json.loads(sanitized, strict=False)
-            if isinstance(data, dict):
-                name = data.get("name") or data.get("function")
-                args = data.get("arguments") or data.get("parameters") or data.get("input", {})
-                if name:
-                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-                    results.append((str(name).strip(), args_str))
-        except Exception:
-            pass
-
-    # Fallback 3: парсим поврежденный JSON с неэкранированными внутренними кавычками
-    if not results:
-        name_match = re.search(r'"(?:name|function)"\s*:\s*"([a-zA-Z0-9_\-\.]+)"', s)
-        if name_match:
-            name = name_match.group(1).strip()
-            args_start = re.search(r'"(?:arguments|parameters|input)"\s*:\s*(\{)', s)
-            if args_start:
-                brace_start = args_start.start(1)
-                brace_count = 0
-                brace_end = -1
-                for i in range(brace_start, len(s)):
-                    if s[i] == '{':
-                        brace_count += 1
-                    elif s[i] == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            brace_end = i + 1
-                            break
-                if brace_end != -1:
-                    args_raw = s[brace_start:brace_end]
-                    args_dict = _parse_broken_arguments(args_raw)
-                    if args_dict:
-                        results.append((name, json.dumps(args_dict, ensure_ascii=False)))
-
-    return results
+    return None
 
 
 def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     """
-    Извлекает вызовы инструментов из ответа модели:
-    - Поддерживает один или несколько JSON-объектов внутри одного тега <tool_call>...</tool_call>.
-    - Поддерживает гибридные теги параметров Qwen (<parameter=key>...</parameter>).
-    - Поддерживает теги <tool_call>...</tool_call> (включая <tool_call"> и с атрибутами).
-    - Поддерживает markdown блоки ```tool_call...```.
-    - Поддерживает нативный формат Qwen <function=name>...</function>.
-    - Поддерживает многострочный код внутри аргументов (strict=False).
-    - Выполняет дедупликацию идентичных вызовов.
-    Возвращает (очищенный_текст, список_tool_calls).
+    Универсальный парсер вызовов инструментов для DeepSeek и Qwen.
+    Поддерживает форматы:
+    - <tool_call> ... </tool_call> (включая непарные кавычки <tool_call">)
+    - Несколько JSON объектов подряд внутри одного <tool_call>
+    - DeepSeek DSML: <｜DSML｜tool_calls> ... <｜DSML｜invoke name="..."> ...
+    - Claude/DeepSeek XML: <invoke name="..."> <parameter name="..."> ...
+    - Стандартный OpenAI тег: <function=name> ... </function>
+    - Голый JSON без тегов: {"name": "...", "arguments": {...}}
     """
+    if not text:
+        return text, []
+
     tool_calls: List[OpenAIToolCall] = []
     seen_calls = set()
+
+    def add_call(name: str, args_str: str) -> bool:
+        name = name.strip()
+        if not name:
+            return False
+        key = (name, args_str.strip())
+        if key in seen_calls:
+            return False
+        seen_calls.add(key)
+        call_id = f"call_{len(tool_calls)+1}_{abs(hash(key)) % 1000000}"
+        tool_calls.append(
+            OpenAIToolCall(
+                id=call_id,
+                type="function",
+                function=OpenAIToolCallFunction(
+                    name=name,
+                    arguments=args_str,
+                )
+            )
+        )
+        return True
+
     clean_text = text
 
-    # 0. Проверка формата DeepSeek DSML: <｜DSML｜tool_calls>...<｜DSML｜invoke name="...">...</｜DSML｜invoke>...</｜DSML｜tool_calls>
-    dsml_invoke_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*invoke\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*invoke>"
-    dsml_param_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*parameter\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*parameter>"
+    # --- 1. DeepSeek DSML Markup (<｜DSML｜tool_calls> ... <｜DSML｜invoke name="...">) ---
+    dsml_pattern = r'<[｜|]DSML[｜|]tool_calls>([\s\S]*?)<[｜|]DSML[｜|]tool_calls>'
+    dsml_matches = list(re.finditer(dsml_pattern, clean_text))
+    if dsml_matches:
+        for m in dsml_matches:
+            block = m.group(1)
+            invokes = re.finditer(r'<[｜|]DSML[｜|]invoke name="([^"]+)">([\s\S]*?)</[｜|]DSML[｜|]invoke>', block)
+            for inv in invokes:
+                fn_name = inv.group(1)
+                inv_body = inv.group(2)
+                params_dict = {}
+                param_matches = re.finditer(r'<[｜|]DSML[｜|]parameter name="([^"]+)"[^>]*>([\s\S]*?)</[｜|]DSML[｜|]parameter>', inv_body)
+                for pm in param_matches:
+                    p_name = pm.group(1)
+                    p_val = pm.group(2).strip()
+                    try:
+                        p_parsed = json.loads(p_val)
+                        params_dict[p_name] = p_parsed
+                    except Exception:
+                        params_dict[p_name] = p_val
+                add_call(fn_name, json.dumps(params_dict, ensure_ascii=False))
+            clean_text = clean_text.replace(m.group(0), "")
 
-    for match in re.finditer(dsml_invoke_pat, text, re.DOTALL):
-        name = match.group(1).strip()
-        body = match.group(2).strip()
-        args_dict = {}
-        for pm in re.finditer(dsml_param_pat, body, re.DOTALL):
-            p_name = pm.group(1).strip()
-            p_val = pm.group(2).strip()
-            if (p_val.startswith("{") and p_val.endswith("}")) or (p_val.startswith("[") and p_val.endswith("]")):
+    # --- 2. Claude/DeepSeek XML Invoke (<invoke name="..."> <parameter name="..."> ...) ---
+    xml_invoke_pattern = r'<invoke name="([^"]+)">([\s\S]*?)</invoke>'
+    xml_invokes = list(re.finditer(xml_invoke_pattern, clean_text))
+    if xml_invokes:
+        for inv in xml_invokes:
+            fn_name = inv.group(1)
+            inv_body = inv.group(2)
+            params_dict = {}
+            param_matches = re.finditer(r'<parameter name="([^"]+)">([\s\S]*?)</parameter>', inv_body)
+            for pm in param_matches:
+                p_name = pm.group(1)
+                p_val = pm.group(2).strip()
                 try:
-                    p_val = json.loads(p_val)
+                    p_parsed = json.loads(p_val)
+                    params_dict[p_name] = p_parsed
                 except Exception:
-                    pass
-            args_dict[p_name] = p_val
+                    params_dict[p_name] = p_val
+            add_call(fn_name, json.dumps(params_dict, ensure_ascii=False))
+            clean_text = clean_text.replace(inv.group(0), "")
 
-        args_str = json.dumps(args_dict, ensure_ascii=False)
-        call_key = (name, args_str)
-        if call_key not in seen_calls:
-            seen_calls.add(call_key)
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
-            tool_calls.append(
-                OpenAIToolCall(
-                    id=call_id,
-                    type="function",
-                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
-                )
-            )
+    # Очищаем обрамляющие теги XML вызовов
+    clean_text = re.sub(r'</?(?:tool_call|tool_calls|tools)>', '', clean_text)
 
-    clean_text = re.sub(r"<[｜\|]*\s*DSML\s*[｜\|]*tool_calls?>.*?</[｜\|]*\s*DSML\s*[｜\|]*tool_calls?>", "", clean_text, flags=re.DOTALL)
-    clean_text = re.sub(dsml_invoke_pat, "", clean_text, flags=re.DOTALL)
-    clean_text = re.sub(r"</?[｜\|]*\s*DSML\s*[｜\|]*[^>]*>", "", clean_text)
+    # --- 3. <tool_call> ... </tool_call> (с поддержкой нескольких JSON внутри) ---
+    tool_call_regex = r'<tool_call["\']?>([\s\S]*?)</tool_call["\']?>'
+    tool_matches = list(re.finditer(tool_call_regex, clean_text, re.IGNORECASE))
+    if tool_matches:
+        for match in tool_matches:
+            content = match.group(1).strip()
+            parsed_any = False
 
-    # 1. Проверка формата Claude / Anthropic / DeepSeek: <invoke name="...">...</invoke>
-    invoke_pat = r"<invoke\s+name=[\"']?([a-zA-Z0-9_\-\.]+)[\"']?[^>]*>\s*(.*?)\s*</invoke>"
-    param_pat = r"<parameter\s+(?:name=[\"']?([a-zA-Z0-9_\-]+)[\"']?|=([a-zA-Z0-9_\-]+)|([a-zA-Z0-9_\-]+))[^>]*>\s*(.*?)\s*</parameter>"
+            res = parse_tool_call_json(content)
+            if res:
+                fn_name, args_str = res
+                if add_call(fn_name, args_str):
+                    parsed_any = True
 
-    for match in re.finditer(invoke_pat, text, re.DOTALL):
-        name = match.group(1).strip()
-        body = match.group(2).strip()
-        args_dict = {}
-        for pm in re.finditer(param_pat, body, re.DOTALL):
-            p_name = pm.group(1) or pm.group(2) or pm.group(3)
-            p_val = pm.group(4).strip()
-            if (p_val.startswith("{") and p_val.endswith("}")) or (p_val.startswith("[") and p_val.endswith("]")):
-                try:
-                    p_val = json.loads(p_val)
-                except Exception:
-                    pass
-            args_dict[p_name] = p_val
+            if not parsed_any:
+                json_candidates = re.finditer(r'\{[\s\S]*?\}', content)
+                for cand in json_candidates:
+                    c_str = cand.group(0)
+                    res_c = parse_tool_call_json(c_str)
+                    if res_c:
+                        fn_name, args_str = res_c
+                        add_call(fn_name, args_str)
 
-        args_str = json.dumps(args_dict, ensure_ascii=False)
-        call_key = (name, args_str)
-        if call_key not in seen_calls:
-            seen_calls.add(call_key)
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
-            tool_calls.append(
-                OpenAIToolCall(
-                    id=call_id,
-                    type="function",
-                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
-                )
-            )
+            clean_text = clean_text.replace(match.group(0), "")
 
-    # Очищаем блоки invoke (включая если они обернуты в <tool_call>...<invoke>...</tool_calls>)
-    clean_text = re.sub(r"<tool_calls?[^>]*>\s*(?:<invoke\b.*?</invoke>\s*)+</tool_calls?>", "", clean_text, flags=re.DOTALL)
-    clean_text = re.sub(invoke_pat, "", clean_text, flags=re.DOTALL)
-
-    # 2. Паттерны для поиска стандартных блоков JSON tool_call
-    patterns = [
-        r"<tool_calls?[^>]*>\s*(.*?)\s*</tool_calls?[^>]*>",
-        r"```(?:tool_call|tool_calls|function_call)\s*(.*?)\s*```",
-    ]
-
-    for pat in patterns:
-        for match in re.finditer(pat, text, re.DOTALL):
-            raw_content = match.group(1)
-            parsed_list = _parse_all_tool_json(raw_content)
-            for name, args_str in parsed_list:
-                call_key = (name, args_str)
-                if call_key not in seen_calls:
-                    seen_calls.add(call_key)
-                    call_id = f"call_{uuid.uuid4().hex[:8]}"
-                    tool_calls.append(
-                        OpenAIToolCall(
-                            id=call_id,
-                            type="function",
-                            function=OpenAIToolCallFunction(name=name, arguments=args_str),
-                        )
-                    )
-            clean_text = re.sub(pat, "", clean_text, flags=re.DOTALL)
-
-    # 3. Проверка нативного формата Qwen: <function=name>args</function>
-    func_pat = r"<function=([a-zA-Z0-9_\-\.]+)[^>]*>\s*(.*?)\s*</function>"
-    for match in re.finditer(func_pat, text, re.DOTALL):
-        name = match.group(1).strip()
-        raw_args = match.group(2).strip()
-        args_str = raw_args
-        if "<parameter" in raw_args:
-            param_dict = {}
-            for p in re.finditer(r'<parameter=([a-zA-Z0-9_\-]+)>\s*(.*?)\s*(?:</parameter>|$)', raw_args, re.DOTALL):
-                param_dict[p.group(1)] = p.group(2).strip().strip("\"'")
-            if param_dict:
-                args_str = json.dumps(param_dict, ensure_ascii=False)
-        else:
+    # --- 4. <function=name> ... </function> ---
+    fn_tag_regex = r'<function=([a-zA-Z0-9_]+)>([\s\S]*?)</function>'
+    fn_matches = list(re.finditer(fn_tag_regex, clean_text, re.IGNORECASE))
+    if fn_matches:
+        for match in fn_matches:
+            fn_name = match.group(1)
+            content = match.group(2).strip()
             try:
-                args_obj = json.loads(raw_args, strict=False)
-                args_str = json.dumps(args_obj, ensure_ascii=False) if isinstance(args_obj, dict) else str(args_obj)
+                norm_content = normalize_qwen_parameter_tags(content)
+                args_dict = json.loads(norm_content)
+                args_str = json.dumps(args_dict, ensure_ascii=False)
             except Exception:
-                args_str = raw_args
+                args_str = content
+            add_call(fn_name, args_str)
+            clean_text = clean_text.replace(match.group(0), "")
 
-        call_key = (name, args_str)
-        if call_key not in seen_calls:
-            seen_calls.add(call_key)
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
-            tool_calls.append(
-                OpenAIToolCall(
-                    id=call_id,
-                    type="function",
-                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
-                )
-            )
-    clean_text = re.sub(func_pat, "", clean_text, flags=re.DOTALL)
+    # --- 5. Голый JSON без тегов: {"name": "...", "arguments": {...}} ---
+    if not tool_calls:
+        naked_json_regex = r'\{\s*"name"\s*:\s*"([a-zA-Z0-9_]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}'
+        naked_matches = list(re.finditer(naked_json_regex, clean_text))
+        if naked_matches:
+            for nm in naked_matches:
+                fn_name = nm.group(1)
+                args_str = nm.group(2)
+                try:
+                    args_dict = json.loads(args_str)
+                    args_str = json.dumps(args_dict, ensure_ascii=False)
+                except Exception:
+                    pass
+                add_call(fn_name, args_str)
+                clean_text = clean_text.replace(nm.group(0), "")
 
-    # 4. Проверка "голого" JSON вызова инструмента без обрамляющих тегов (Naked JSON tool call)
-    naked_pat = re.compile(
-        r'\{\s*"(?:name|function)"\s*:\s*"([a-zA-Z0-9_\-\.]+)"\s*,\s*"(?:arguments|parameters|input)"\s*:\s*(\{)',
-        re.DOTALL
-    )
-    for match in naked_pat.finditer(clean_text):
-        name = match.group(1).strip()
-        start_idx = match.start()
-        args_brace_start = match.start(2)
+    # --- 6. Голый JSON с неэкранированными кавычками внутри "command": "..." ---
+    if not tool_calls:
+        loose_regex = r'\{\s*"name"\s*:\s*"([a-zA-Z0-9_]+)"\s*,\s*"arguments"\s*:\s*\{([\s\S]*?)\}\s*\}'
+        loose_matches = list(re.finditer(loose_regex, clean_text))
+        for lm in loose_matches:
+            fn_name = lm.group(1)
+            raw_full = lm.group(0)
+            repaired = repair_json_argument_strings(raw_full)
+            res = parse_tool_call_json(repaired)
+            if res:
+                add_call(res[0], res[1])
+                clean_text = clean_text.replace(raw_full, "")
 
-        brace_count = 0
-        args_end_idx = -1
-        for i in range(args_brace_start, len(clean_text)):
-            if clean_text[i] == '{':
-                brace_count += 1
-            elif clean_text[i] == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    args_end_idx = i + 1
-                    break
-
-        if args_end_idx == -1:
-            continue
-
-        args_raw = clean_text[args_brace_start:args_end_idx]
-        outer_end_idx = clean_text.find('}', args_end_idx)
-        if outer_end_idx != -1:
-            outer_end_idx += 1
-        else:
-            outer_end_idx = args_end_idx
-
-        block = clean_text[start_idx:outer_end_idx]
-        args_dict = _parse_broken_arguments(args_raw)
-        args_str = json.dumps(args_dict, ensure_ascii=False) if args_dict else "{}"
-
-        call_key = (name, args_str)
-        if call_key not in seen_calls:
-            seen_calls.add(call_key)
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
-            tool_calls.append(
-                OpenAIToolCall(
-                    id=call_id,
-                    type="function",
-                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
-                )
-            )
-        clean_text = clean_text.replace(block, "")
-
-    # Реверсивный порядок: {"arguments": ..., "name": "..."}
-    naked_rev_pat = re.compile(
-        r'\{\s*"(?:arguments|parameters|input)"\s*:\s*(\{.*?\}).*?,\s*"(?:name|function)"\s*:\s*"([a-zA-Z0-9_\-\.]+)"\s*\}',
-        re.DOTALL
-    )
-    for match in naked_rev_pat.finditer(clean_text):
-        args_raw = match.group(1).strip()
-        name = match.group(2).strip()
-        block = match.group(0)
-
-        args_dict = _parse_broken_arguments(args_raw)
-        args_str = json.dumps(args_dict, ensure_ascii=False) if args_dict else "{}"
-
-        call_key = (name, args_str)
-        if call_key not in seen_calls:
-            seen_calls.add(call_key)
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
-            tool_calls.append(
-                OpenAIToolCall(
-                    id=call_id,
-                    type="function",
-                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
-                )
-            )
-        clean_text = clean_text.replace(block, "")
-
-    return clean_text.strip(), tool_calls
+    clean_text = clean_text.strip()
+    return clean_text, tool_calls
