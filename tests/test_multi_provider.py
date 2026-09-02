@@ -332,7 +332,9 @@ def test_intent_pattern_matching():
     sample1 = "Изучил структуру проекта. Теперь мне нужно понять, как в Stepik API представлены задания со стоимостью и текст заданий. Изучу оставшиеся файлы бэкенда и фронтенд-структуру."
     sample2 = "Let me check the backend code to understand how endpoints are configured."
     sample3 = "Вот готовый результат работы программы. Всего хорошего!"
+    sample4 = "Let me study the remaining backend files and frontend structure to fully understand the project before planning."
 
     assert INTENT_PAT.search(sample1) is not None
     assert INTENT_PAT.search(sample2) is not None
     assert INTENT_PAT.search(sample3) is None
+    assert INTENT_PAT.search(sample4) is not None

@@ -30,8 +30,16 @@ from app.schemas.openai import (
 from app.services.tool_parser import extract_tool_calls, format_messages_to_prompt
 
 INTENT_PAT = re.compile(
-    r'(?:изучу|проверю|посмотрю|открою|прочитаю|найду|запущу|выполню|исследую|начну|let me (?:check|read|explore|inspect|run|look)|i will (?:check|read|explore|inspect|run|look))'
-    r'[^.!?\n]{0,80}(?:файл|код|проект|директори|папк|api|структур|file|code|dir|repo|output)',
+    r'(?:'
+    r'изучу|исследую|посмотрю|проверю|гляну|разберу|проанализирую|прочитаю|открою|найду|загляну|ознакомлюсь|выполню|запущу|начну|'
+    r'давайте\s+(?:изучим|посмотрим|проверим|исследуем|откроем|глянем)|'
+    r'нужно\s+(?:изучить|посмотреть|проверить|исследовать|открыть|понять)|'
+    r'let\s+me\s+(?:study|examine|investigate|analyze|review|search|scan|see|find|check|read|explore|inspect|run|look)|'
+    r'i\s*(?:will|\'ll|\s+need\s+to)\s+(?:study|examine|investigate|analyze|review|search|scan|see|find|check|read|explore|inspect|run|look|understand)|'
+    r'(?:next|first|now),?\s+(?:i\s+will|let\s+me)'
+    r')'
+    r'[^.!?\n]{0,120}'
+    r'(?:файл|код|проект|директори|папк|api|структур|конфиг|скрипт|репозитори|file|code|dir|repo|output|struct|backend|frontend|project|folder|plan)',
     re.IGNORECASE,
 )
 
