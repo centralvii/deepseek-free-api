@@ -135,13 +135,15 @@ class QwenProvider(BaseLLMProvider):
     def _resolve_qwen_model(self, requested_model: str) -> str:
         req_lower = requested_model.lower().strip()
         if req_lower in ["qwen-3.8-coder", "3.8-coder", "qwen-coder", "coder"]:
-            return "qwen3.7-plus"
+            return "qwen3.8-max"
+        if req_lower in ["qwen-3.8", "3.8", "qwen3", "qwen3.8-max", "3.8-max"]:
+            return "qwen3.8-max"
         if req_lower in ["qwen3.7-plus", "3.7-plus", "qwen-3.7", "3.7", "qwen", ""]:
             return "qwen3.7-plus"
-        if req_lower in ["qwen-3.8", "3.8", "qwen3"]:
-            return "qwen3.7-plus"
+        if req_lower in ["qwen3.7-max", "3.7-max"]:
+            return "qwen3.7-max"
         if req_lower in ["qwen-3-max", "max", "qwen-max"]:
-            return "qwen3.7-plus"
+            return "qwen3.8-max"
         if req_lower in ["qwen-3-flash", "flash", "qwen-flash"]:
             return "qwen3.7-plus"
         if req_lower in ["qwen-3-plus", "plus"]:

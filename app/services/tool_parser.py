@@ -30,7 +30,9 @@ You have access to the following functions/tools to assist the user:
 ```
 
 # Tool Call Instructions
-When you need to call one or more tools, you MUST output each tool call inside a `<tool_call>` XML block with a valid JSON object containing `"name"` and `"arguments"`.
+CRITICAL REQUIREMENT:
+- When the user asks you to create, write, edit, replace, or modify files, or execute commands, you MUST NOT merely output code or commands in markdown.
+- You MUST invoke the appropriate tool using a `<tool_call>` block with a valid JSON object containing `"name"` and `"arguments"`.
 
 Example format:
 <tool_call>
@@ -107,44 +109,101 @@ def format_messages_to_prompt(
     return full_prompt
 
 
+def _parse_tool_json(raw_json: str) -> Optional[Tuple[str, str]]:
+    """Пытается распарсить JSON вызова инструмента с обработкой переносов строк в коде."""
+    if not raw_json:
+        return None
+    raw = raw_json.strip()
+
+    # 1. Первая попытка: стандартный json.loads с strict=False (разрешает unescaped newlines/tabs в коде)
+    try:
+        data = json.loads(raw, strict=False)
+        if isinstance(data, dict):
+            name = data.get("name") or data.get("function")
+            args = data.get("arguments") or data.get("parameters") or data.get("input", {})
+            if name:
+                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                return str(name).strip(), args_str
+    except Exception:
+        pass
+
+    # 2. Вторая попытка: экранируем сырые символы перевода строк
+    try:
+        sanitized = re.sub(r'[\r\n]+', '\\n', raw)
+        data = json.loads(sanitized, strict=False)
+        if isinstance(data, dict):
+            name = data.get("name") or data.get("function")
+            args = data.get("arguments") or data.get("parameters") or data.get("input", {})
+            if name:
+                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                return str(name).strip(), args_str
+    except Exception:
+        pass
+
+    return None
+
+
 def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     """
     Извлекает вызовы инструментов из ответа модели:
-    Поддерживает теги <tool_call>...</tool_call> и блоки json с вызовами функций.
+    - Поддерживает теги <tool_call>...</tool_call> (включая <tool_call"> и с атрибутами).
+    - Поддерживает markdown блоки ```tool_call...```.
+    - Поддерживает нативный формат Qwen <function=name>...</function>.
+    - Поддерживает многострочный код внутри аргументов (strict=False).
+    - Выполняет дедупликацию идентичных вызовов.
     Возвращает (очищенный_текст, список_tool_calls).
     """
     tool_calls: List[OpenAIToolCall] = []
+    seen_calls = set()
     clean_text = text
 
-    # 1. Поиск XML-тегов <tool_call>...</tool_call>
-    pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
-    matches = list(re.finditer(pattern, text, re.DOTALL))
+    # Паттерны для поиска
+    patterns = [
+        r"<tool_call[^>]*>\s*(.*?)\s*</tool_call[^>]*>",
+        r"```(?:tool_call|function_call)\s*(.*?)\s*```",
+    ]
 
-    for idx, match in enumerate(matches):
-        raw_json = match.group(1).strip()
-        try:
-            data = json.loads(raw_json)
-            name = data.get("name") or data.get("function")
-            args = data.get("arguments", {})
-            if isinstance(args, dict):
-                args_str = json.dumps(args, ensure_ascii=False)
-            else:
-                args_str = str(args)
-
-            if name:
-                call_id = f"call_{uuid.uuid4().hex[:8]}"
-                tool_calls.append(
-                    OpenAIToolCall(
-                        id=call_id,
-                        type="function",
-                        function=OpenAIToolCallFunction(name=name, arguments=args_str),
+    for pat in patterns:
+        for match in re.finditer(pat, text, re.DOTALL):
+            raw_content = match.group(1)
+            parsed = _parse_tool_json(raw_content)
+            if parsed:
+                name, args_str = parsed
+                call_key = (name, args_str)
+                if call_key not in seen_calls:
+                    seen_calls.add(call_key)
+                    call_id = f"call_{uuid.uuid4().hex[:8]}"
+                    tool_calls.append(
+                        OpenAIToolCall(
+                            id=call_id,
+                            type="function",
+                            function=OpenAIToolCallFunction(name=name, arguments=args_str),
+                        )
                     )
-                )
+            clean_text = re.sub(pat, "", clean_text, flags=re.DOTALL)
+
+    # 3. Проверка нативного формата Qwen: <function=name>args</function>
+    func_pat = r"<function=([a-zA-Z0-9_\-\.]+)[^>]*>\s*(.*?)\s*</function>"
+    for match in re.finditer(func_pat, text, re.DOTALL):
+        name = match.group(1).strip()
+        raw_args = match.group(2).strip()
+        try:
+            args_obj = json.loads(raw_args, strict=False)
+            args_str = json.dumps(args_obj, ensure_ascii=False) if isinstance(args_obj, dict) else str(args_obj)
         except Exception:
-            pass
+            args_str = raw_args
 
-    # Удаляем теги <tool_call> из видимого текста ответа
-    if tool_calls:
-        clean_text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+        call_key = (name, args_str)
+        if call_key not in seen_calls:
+            seen_calls.add(call_key)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=call_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
+                )
+            )
+    clean_text = re.sub(func_pat, "", clean_text, flags=re.DOTALL)
 
-    return clean_text, tool_calls
+    return clean_text.strip(), tool_calls

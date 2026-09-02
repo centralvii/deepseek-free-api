@@ -37,7 +37,9 @@ You have access to the following functions/tools to assist the user:
 ```
 
 # Tool Call Instructions
-When you need to call one or more tools, you MUST output each tool call inside a `<tool_call>` XML block with a valid JSON object containing `"name"` and `"arguments"`.
+CRITICAL REQUIREMENT:
+- When the user asks you to create, write, edit, replace, or modify files, or execute commands, you MUST NOT merely output code or commands in markdown.
+- You MUST invoke the appropriate tool using a `<tool_call>` block with a valid JSON object containing `"name"` and `"arguments"`.
 
 Example format:
 <tool_call>

@@ -132,3 +132,32 @@ async def test_stream_error_sse_formatting(monkeypatch):
         text = resp.text
         assert "WAF challenge error" in text
         assert "data: [DONE]" in text
+
+
+def test_robust_tool_call_extraction():
+    """Тестирует парсинг вызовов инструментов с многострочным кодом, опечатками в тегах и дедупликацией."""
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """
+Вот созданный файл:
+
+<tool_call">
+{"name": "write_to_file", "arguments": {"path": "calculator.py", "content": "def add(a, b):\n    return a + b\n\nprint(add(2, 3))\n"}}
+</tool_call">
+
+<tool_call>
+{"name": "write_to_file", "arguments": {"path": "calculator.py", "content": "def add(a, b):\n    return a + b\n\nprint(add(2, 3))\n"}}
+</tool_call>
+
+<function=replace_in_file>
+{"path": "main.py", "diff": "- old\n+ new"}
+</function>
+"""
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 2  # Дубликат write_to_file отсеян, добавлен replace_in_file
+    assert calls[0].function.name == "write_to_file"
+    assert "calculator.py" in calls[0].function.arguments
+    assert calls[1].function.name == "replace_in_file"
+    assert "main.py" in calls[1].function.arguments
+    assert "<tool_call" not in clean_text
+    assert "<function=" not in clean_text
