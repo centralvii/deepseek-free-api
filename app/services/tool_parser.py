@@ -5,17 +5,63 @@ from typing import List, Optional, Tuple, Any, Dict
 from app.schemas.openai import OpenAIChatMessage, OpenAITool, OpenAIToolCall, OpenAIToolCallFunction
 
 
+def compact_tool_schema(value: Any, is_root: bool = True) -> Any:
+    """
+    Компактизирует JSON Schema параметров инструмента:
+    - Удаляет избыточные метаданные (title, $comment, verbose examples).
+    - Сохраняет валидационную структуру (type, properties, required, enum, const, items).
+    - Сокращает чрезмерно длинные описания параметров (>120 симв.).
+    """
+    if isinstance(value, list):
+        return [compact_tool_schema(item, is_root=False) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    compact = {}
+    for k, v in value.items():
+        if not is_root and k in {"title", "$comment"}:
+            continue
+        if not is_root and k == "description" and isinstance(v, str) and len(v) > 120:
+            compact[k] = v[:117] + "..."
+            continue
+
+        if k in {"properties", "patternProperties", "definitions", "$defs"} and isinstance(v, dict):
+            compact[k] = {pk: compact_tool_schema(pv, is_root=False) for pk, pv in v.items()}
+        elif k in {"items", "additionalProperties", "contains"} and isinstance(v, dict):
+            compact[k] = compact_tool_schema(v, is_root=False)
+        elif k in {"anyOf", "allOf", "oneOf", "prefixItems"} and isinstance(v, list):
+            compact[k] = [compact_tool_schema(item, is_root=False) for item in v]
+        else:
+            compact[k] = v
+    return compact
+
+
 def build_tool_system_prompt(tools: List[OpenAITool]) -> str:
     """Формирует системную инструкцию с описанием доступных инструментов (JSON Schema)."""
+    raw_schema_chars = sum(
+        len(json.dumps(tool.function.parameters or {}))
+        for tool in tools
+        if tool.type == "function" and tool.function
+    )
+    should_compact = raw_schema_chars > 12_000 or len(tools) > 15
+
     tools_definitions = []
     for tool in tools:
         if tool.type == "function" and tool.function:
+            fn_name = tool.function.name
+            desc = str(tool.function.description or "").strip()
+            if len(desc) > 350:
+                desc = desc[:347] + "..."
+            params = tool.function.parameters or {"type": "object", "properties": {}}
+            if should_compact:
+                params = compact_tool_schema(params)
+
             tools_definitions.append({
                 "type": "function",
                 "function": {
-                    "name": tool.function.name,
-                    "description": tool.function.description or "",
-                    "parameters": tool.function.parameters or {"type": "object", "properties": {}},
+                    "name": fn_name,
+                    "description": desc,
+                    "parameters": params,
                 }
             })
 
@@ -30,16 +76,18 @@ You have access to the following functions/tools to assist the user:
 ```
 
 # Tool Call Instructions
-CRITICAL REQUIREMENT:
-- When the user asks you to create, write, edit, replace, or modify files, or execute commands, you MUST NOT merely output code or commands in markdown.
-- You MUST invoke the appropriate tool using a `<tool_call>` block with a valid JSON object containing `"name"` and `"arguments"`.
-- DIRECT TOOL EXECUTION: When performing file operations (reading, writing, editing, listing, or searching files) or terminal commands, invoke the direct tool (such as Read, Write, Edit, Bash, Glob, Grep) directly. Do NOT delegate file operations to subagent tools (like `Agent` or `Task`).
-- PURE JSON FORMAT: Output clean, strictly valid JSON inside `<tool_call>`. Never output XML parameter tags (such as `<parameter=...>` or `</parameter>`).
-
-Example format:
+CRITICAL RULES:
+1. You ONLY REASON and REQUEST tool executions. You do NOT execute any commands or files yourself.
+2. When performing actions (reading, writing, editing files, searching, running terminal commands), REQUEST the tool call.
+3. NEVER simulate, guess, or fabricate command or tool output — output the tool call and wait for the actual result from the system.
+4. When requesting a tool, output ONLY the tool call. Do NOT add explanation, text, or markdown before or after the tool call.
+5. PURE JSON FORMAT: Output strictly valid JSON inside `<tool_call>...</tool_call>`:
 <tool_call>
-{{"name": "tool_name", "arguments": {{"param1": "value1"}}}}
+{{"name": "<function_name>", "arguments": {{...}}}}
 </tool_call>
+
+Alternatively, standard JSON format is also accepted:
+{{"tool_call": {{"name": "<function_name>", "arguments": {{...}}}}}}
 
 If no tool call is needed, provide your normal conversational response directly.
 """
