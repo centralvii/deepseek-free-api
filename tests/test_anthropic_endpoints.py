@@ -55,10 +55,10 @@ def test_anthropic_response_with_tools_and_thinking():
     assert anthropic_resp.stop_reason == "tool_use"
     assert anthropic_resp.usage.output_tokens == 120
 
+    # Проверяем блоки content: при tool_use должны быть строго чистые tool_use блоки
     types = [b.type for b in anthropic_resp.content]
-    assert "thinking" in types
-    assert "text" in types
     assert "tool_use" in types
+    assert "thinking" not in types
 
     tool_block = next(b for b in anthropic_resp.content if b.type == "tool_use")
     assert tool_block.name == "get_weather"
@@ -66,8 +66,25 @@ def test_anthropic_response_with_tools_and_thinking():
     assert tool_block.id.startswith("toolu_")
 
 
+def test_anthropic_response_with_thinking_no_tools():
+    """Тестирует обычный ответ с thinking без вызовов инструментов."""
+    mock_resp = DeepSeekChatResponse(
+        content="The weather in Moscow is 15C.",
+        thinking="Checking weather facts.",
+        session_id="test-sess",
+        message_id=10,
+        token_usage=120,
+    )
+    anthropic_resp = convert_deepseek_response_to_anthropic(mock_resp, model="deepseek-v4-pro", has_tools=False)
+    types = [b.type for b in anthropic_resp.content]
+    assert "thinking" in types
+    assert "text" in types
+    assert anthropic_resp.stop_reason == "end_turn"
+
+
 @pytest.mark.asyncio
 async def test_anthropic_endpoint_validation():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # Проверка пустого запроса
         resp = await ac.post("/v1/messages", json={"messages": []})
         assert resp.status_code == 400 or resp.status_code == 422

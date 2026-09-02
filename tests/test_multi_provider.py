@@ -265,3 +265,35 @@ def test_naked_json_tool_call_with_unescaped_quotes():
     assert clean_text == "Изучу проект, чтобы понять текущую структуру парсера."
     assert "{" not in clean_text
     assert "Bash" not in clean_text
+
+
+def test_compact_tool_schema():
+    """Тестирует компактное сжатие JSON Schema инструментов."""
+    from app.services.tool_parser import compact_tool_schema
+
+    schema = {
+        "type": "object",
+        "title": "ToolArguments",
+        "description": "Top-level description of tool arguments",
+        "properties": {
+            "command": {
+                "type": "string",
+                "title": "CommandTitle",
+                "description": "A very long detailed description of what this command is going to do when executed on the local terminal environment in milliseconds.",
+            },
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+            },
+        },
+        "required": ["command"],
+    }
+
+    compacted = compact_tool_schema(schema)
+    assert compacted["type"] == "object"
+    assert "properties" in compacted
+    assert compacted["properties"]["command"]["type"] == "string"
+    assert "title" not in compacted["properties"]["command"]
+    assert compacted["properties"]["command"]["description"].endswith("...")
+    assert len(compacted["properties"]["command"]["description"]) <= 120
+    assert compacted["required"] == ["command"]
