@@ -132,16 +132,15 @@ async def anthropic_messages(
 
                     # Блок текста ответа (Content)
                     elif chunk.type == "content":
-                        proxy_logger.log_content_chunk(log_id, chunk.text)
-                        if in_thinking_block:
-                            cb_stop = {"type": "content_block_stop", "index": block_index}
-                            yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
-                            in_thinking_block = False
-                            block_index += 1
-
                         accumulated_content.append(chunk.text)
-
                         if not has_tools:
+                            proxy_logger.log_content_chunk(log_id, chunk.text)
+                            if in_thinking_block:
+                                cb_stop = {"type": "content_block_stop", "index": block_index}
+                                yield f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n"
+                                in_thinking_block = False
+                                block_index += 1
+
                             if not in_text_block:
                                 cb_start = {
                                     "type": "content_block_start",
@@ -171,6 +170,7 @@ async def anthropic_messages(
                 if has_tools:
                     clean_text, tool_calls = extract_tool_calls(full_text)
                     if clean_text:
+                        proxy_logger.log_content_chunk(log_id, clean_text)
                         cb_start = {
                             "type": "content_block_start",
                             "index": block_index,

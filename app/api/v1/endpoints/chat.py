@@ -144,9 +144,9 @@ async def openai_chat_completions(
 
                     # Основной ответ
                     elif chunk.type == "content":
-                        proxy_logger.log_content_chunk(log_id, chunk.text)
                         accumulated_content.append(chunk.text)
                         if not has_tools:
+                            proxy_logger.log_content_chunk(log_id, chunk.text)
                             c = OpenAIChatCompletionChunk(
                                 id=req_id,
                                 model=request.model,
@@ -162,6 +162,8 @@ async def openai_chat_completions(
                     clean_text, tool_calls = extract_tool_calls(full_text)
                     if tool_calls:
                         finish_reason = "tool_calls"
+                        if clean_text:
+                            proxy_logger.log_content_chunk(log_id, clean_text)
                         delta_tools = []
                         for idx, tc in enumerate(tool_calls):
                             proxy_logger.log_tool_call(log_id, tc.function.name, tc.function.arguments)
@@ -183,10 +185,12 @@ async def openai_chat_completions(
                         )
                         yield f"data: {c.model_dump_json()}\n\n"
                     else:
+                        if clean_text:
+                            proxy_logger.log_content_chunk(log_id, clean_text)
                         c = OpenAIChatCompletionChunk(
                             id=req_id,
                             model=request.model,
-                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=full_text))],
+                            choices=[OpenAIChunkChoice(index=0, delta=OpenAIDelta(content=clean_text or full_text))],
                         )
                         yield f"data: {c.model_dump_json()}\n\n"
 

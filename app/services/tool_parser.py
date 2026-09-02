@@ -200,6 +200,41 @@ def extract_tool_calls(text: str) -> Tuple[str, List[OpenAIToolCall]]:
     seen_calls = set()
     clean_text = text
 
+    # 0. Проверка формата DeepSeek DSML: <｜DSML｜tool_calls>...<｜DSML｜invoke name="...">...</｜DSML｜invoke>...</｜DSML｜tool_calls>
+    dsml_invoke_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*invoke\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*invoke>"
+    dsml_param_pat = r"<[｜\|]*\s*DSML\s*[｜\|]*parameter\s+name=[\"']?([^\"'>]+)[\"']?[^>]*>\s*(.*?)\s*</[｜\|]*\s*DSML\s*[｜\|]*parameter>"
+
+    for match in re.finditer(dsml_invoke_pat, text, re.DOTALL):
+        name = match.group(1).strip()
+        body = match.group(2).strip()
+        args_dict = {}
+        for pm in re.finditer(dsml_param_pat, body, re.DOTALL):
+            p_name = pm.group(1).strip()
+            p_val = pm.group(2).strip()
+            if (p_val.startswith("{") and p_val.endswith("}")) or (p_val.startswith("[") and p_val.endswith("]")):
+                try:
+                    p_val = json.loads(p_val)
+                except Exception:
+                    pass
+            args_dict[p_name] = p_val
+
+        args_str = json.dumps(args_dict, ensure_ascii=False)
+        call_key = (name, args_str)
+        if call_key not in seen_calls:
+            seen_calls.add(call_key)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_calls.append(
+                OpenAIToolCall(
+                    id=call_id,
+                    type="function",
+                    function=OpenAIToolCallFunction(name=name, arguments=args_str),
+                )
+            )
+
+    clean_text = re.sub(r"<[｜\|]*\s*DSML\s*[｜\|]*tool_calls?>.*?</[｜\|]*\s*DSML\s*[｜\|]*tool_calls?>", "", clean_text, flags=re.DOTALL)
+    clean_text = re.sub(dsml_invoke_pat, "", clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r"</?[｜\|]*\s*DSML\s*[｜\|]*[^>]*>", "", clean_text)
+
     # 1. Проверка формата Claude / Anthropic / DeepSeek: <invoke name="...">...</invoke>
     invoke_pat = r"<invoke\s+name=[\"']?([a-zA-Z0-9_\-\.]+)[\"']?[^>]*>\s*(.*?)\s*</invoke>"
     param_pat = r"<parameter\s+(?:name=[\"']?([a-zA-Z0-9_\-]+)[\"']?|=([a-zA-Z0-9_\-]+)|([a-zA-Z0-9_\-]+))[^>]*>\s*(.*?)\s*</parameter>"

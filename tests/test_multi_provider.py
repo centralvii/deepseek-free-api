@@ -225,3 +225,25 @@ def test_deepseek_claude_xml_invoke_extraction():
     assert "<invoke" not in clean_text
     assert "<tool_call" not in clean_text
     assert "<tool_calls" not in clean_text
+
+
+def test_deepseek_dsml_tool_calls_extraction():
+    """Тестирует парсинг вызовов инструментов в формате DeepSeek Markup Language (DSML)."""
+    from app.services.tool_parser import extract_tool_calls
+
+    raw_response = """Let me explore the project.
+<｜DSML｜tool_calls>
+    <｜DSML｜invoke name="Bash">
+        <｜DSML｜parameter name="command" string="true">cd /e/vibecoding/stepik-searcher && git status</｜DSML｜parameter>
+        <｜DSML｜parameter name="description" string="true">Check git status</｜DSML｜parameter>
+    </｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+    clean_text, calls = extract_tool_calls(raw_response)
+    assert len(calls) == 1
+    assert calls[0].function.name == "Bash"
+    assert "cd /e/vibecoding/stepik-searcher" in calls[0].function.arguments
+    assert "Check git status" in calls[0].function.arguments
+    assert clean_text == "Let me explore the project."
+    assert "DSML" not in clean_text
+    assert "<｜" not in clean_text
