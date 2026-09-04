@@ -104,11 +104,45 @@ async def openai_chat_completions(
     provider_token_limit = context_compressor.get_limit_for_provider(provider.provider_id)
     compiled_prompt = format_messages_to_prompt(request.messages, request.tools, max_tokens=provider_token_limit)
 
+    # Извлекаем параметр thinking_enabled из запроса (поддерживает boolean, dict и extra_body)
+    thinking_val: Optional[bool] = None
+    if request.thinking_enabled is not None:
+        thinking_val = request.thinking_enabled
+    elif request.thinking is not None:
+        if isinstance(request.thinking, bool):
+            thinking_val = request.thinking
+        elif isinstance(request.thinking, dict):
+            t_type = request.thinking.get("type")
+            if t_type == "disabled":
+                thinking_val = False
+            elif t_type == "enabled":
+                thinking_val = True
+    elif hasattr(request, "model_extra") and request.model_extra:
+        if "thinking_enabled" in request.model_extra:
+            thinking_val = bool(request.model_extra["thinking_enabled"])
+        elif "thinking" in request.model_extra:
+            t = request.model_extra["thinking"]
+            if isinstance(t, bool):
+                thinking_val = t
+            elif isinstance(t, dict):
+                t_type = t.get("type")
+                if t_type == "disabled":
+                    thinking_val = False
+                elif t_type == "enabled":
+                    thinking_val = True
+
+    search_val: Optional[bool] = request.search_enabled
+    if search_val is None and hasattr(request, "model_extra") and request.model_extra:
+        if "search_enabled" in request.model_extra:
+            search_val = bool(request.model_extra["search_enabled"])
+
     deepseek_req = DeepSeekChatRequest(
         prompt=compiled_prompt,
         chat_session_id=request.chat_session_id or request.session_id,
         model=request.model,
         stream=request.stream,
+        thinking_enabled=thinking_val,
+        search_enabled=search_val,
     )
 
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

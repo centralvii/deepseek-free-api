@@ -1,4 +1,7 @@
 import pytest
+import json
+import httpx
+from unittest.mock import patch
 from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.core.credentials import credentials_manager
@@ -132,6 +135,42 @@ async def test_stream_error_sse_formatting(monkeypatch):
         text = resp.text
         assert "WAF challenge error" in text
         assert "data: [DONE]" in text
+
+
+@pytest.mark.asyncio
+async def test_qwen_thinking_disabled_in_openai_endpoint():
+    """Тестирует корректную передачу и отключение режима thinking для моделей Qwen через OpenAI эндпоинт."""
+    captured_requests = []
+
+    async def mock_send(req: httpx.Request, *args, **kwargs):
+        captured_requests.append(req)
+        return httpx.Response(
+            200,
+            content=b"data: {\"v\":{\"response\":{\"status\":\"FINISHED\",\"fragments\":[{\"id\":1,\"type\":\"RESPONSE\",\"content\":\"Fast response\"}]}}}\n\n"
+        )
+
+    qwen_p = provider_registry.get_provider("qwen")
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        with patch("app.providers.qwen_provider.credentials_manager.get_token", return_value="fake_token; qwen-thinking_mode=Thinking;"), \
+             patch.object(qwen_p.client, "send", mock_send):
+            req_payload = {
+                "model": "qwen-3-max",
+                "messages": [{"role": "user", "content": "2+2?"}],
+                "thinking_enabled": False,
+                "chat_session_id": "test-chat-123",
+                "stream": True,
+            }
+            resp = await ac.post("/v1/chat/completions", json=req_payload)
+            assert resp.status_code == 200
+            assert len(captured_requests) == 1
+            sent_req = captured_requests[0]
+            cookie = sent_req.headers.get("cookie", "")
+            assert "qwen-thinking_mode=Normal" in cookie
+            body = json.loads(sent_req.content)
+            feature_config = body["messages"][0]["feature_config"]
+            assert feature_config["thinking_enabled"] is False
+            assert feature_config["thinking_mode"] == "Normal"
 
 
 def test_robust_tool_call_extraction():

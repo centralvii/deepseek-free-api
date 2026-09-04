@@ -34,6 +34,8 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatCompletionRequest(BaseModel):
+    model_config = {"extra": "allow"}
+
     model: str = Field(default="deepseek-v4-pro")
     messages: List[OpenAIChatMessage]
     stream: bool = False
@@ -46,6 +48,9 @@ class OpenAIChatCompletionRequest(BaseModel):
     function_call: Optional[Union[str, Dict[str, Any]]] = None
     chat_session_id: Optional[str] = None
     session_id: Optional[str] = None
+    thinking_enabled: Optional[bool] = None
+    thinking: Optional[Union[bool, Dict[str, Any]]] = None
+    search_enabled: Optional[bool] = None
 
 
 class OpenAIChoiceMessage(BaseModel):

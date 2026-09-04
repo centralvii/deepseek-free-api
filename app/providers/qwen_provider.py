@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import re
 import time
 from typing import AsyncGenerator, List, Optional
 import uuid
@@ -155,8 +156,14 @@ class QwenProvider(BaseLLMProvider):
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%a %b %d %Y %H:%M:%S GMT+0000")
         req_id = str(uuid.uuid4())
 
+        think_mode = "Thinking" if thinking_enabled else "Normal"
+
         if "token=" in token_or_cookie or "; " in token_or_cookie or "_bl_uid=" in token_or_cookie:
             cookie_header = token_or_cookie.strip()
+            if "qwen-thinking_mode=" in cookie_header:
+                cookie_header = re.sub(r'qwen-thinking_mode=[^;]+', f'qwen-thinking_mode={think_mode}', cookie_header)
+            else:
+                cookie_header = f"{cookie_header.rstrip(';')}; qwen-thinking_mode={think_mode};"
             jwt_token = ""
             for part in token_or_cookie.split(";"):
                 part = part.strip()
@@ -164,7 +171,6 @@ class QwenProvider(BaseLLMProvider):
                     jwt_token = part[6:].strip()
         else:
             jwt_token = token_or_cookie.strip()
-            think_mode = "Thinking" if thinking_enabled else "Normal"
             cookie_header = f"token={jwt_token}; qwen-thinking_mode={think_mode}; qwen-locale=ru-RU; qwen-theme=dark;"
 
         referer = f"https://chat.qwen.ai/c/{chat_id}" if chat_id else "https://chat.qwen.ai/"
