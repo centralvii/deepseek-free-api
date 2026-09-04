@@ -8,10 +8,17 @@ logger = logging.getLogger(__name__)
 
 
 class SessionManager:
-    """Управляет жизненным циклом чат-сессий DeepSeek и отслеживает контекст (parent_message_id)."""
+    """Управляет жизненным циклом чат-сессий и отслеживает контекст (parent_message_id).
+    
+    В режиме single_session_mode сессия хранится ОТДЕЛЬНО для каждого провайдера.
+    При смене провайдера (deepseek → qwen → deepseek) восстанавливается прежняя сессия.
+    """
 
     def __init__(self):
+        # Старый одиночный ID (DeepSeek legacy) — теперь хранится в _provider_sessions["deepseek"]
         self._current_session_id: Optional[str] = None
+        # Сессии per-provider: provider_id -> session_id
+        self._provider_sessions: Dict[str, Optional[str]] = {}
         # Сопоставление session_id -> last_message_id (для сохранения контекста диалога)
         self._last_message_ids: Dict[str, Optional[int]] = {}
         # Заголовки чатов
@@ -29,11 +36,41 @@ class SessionManager:
     def is_single_session_mode(self) -> bool:
         return self.single_session_mode
 
+    # ── Per-provider session storage ─────────────────────────────────────────
+
+    def get_provider_session(self, provider_id: str) -> Optional[str]:
+        """Возвращает сохранённый session_id для конкретного провайдера."""
+        sid = self._provider_sessions.get(provider_id)
+        # Обратная совместимость: DeepSeek раньше использовал _current_session_id
+        if sid is None and provider_id == "deepseek":
+            sid = self._current_session_id
+        return sid
+
+    def set_provider_session(self, provider_id: str, session_id: str) -> None:
+        """Сохраняет session_id для конкретного провайдера."""
+        self._provider_sessions[provider_id] = session_id
+        if provider_id == "deepseek":
+            self._current_session_id = session_id
+        if session_id not in self._last_message_ids:
+            self._last_message_ids[session_id] = None
+        logger.debug(f"Сохранена сессия провайдера {provider_id}: {session_id}")
+
+    def clear_provider_session(self, provider_id: str) -> None:
+        """Сбрасывает session_id конкретного провайдера (начать диалог заново)."""
+        old = self._provider_sessions.pop(provider_id, None)
+        if provider_id == "deepseek":
+            self._current_session_id = None
+        if old:
+            logger.info(f"Сессия провайдера {provider_id} сброшена: {old}")
+
+    # ── DeepSeek legacy API (обратная совместимость) ────────────────────────
+
     def invalidate_current_session(self) -> None:
         """Инвалидирует текущую сессию при ошибке или устаревании на сервере."""
         if self._current_session_id:
             logger.warning(f"Инвалидация сессии DeepSeek: {self._current_session_id}")
             self._last_message_ids.pop(self._current_session_id, None)
+            self._provider_sessions.pop("deepseek", None)
             self._current_session_id = None
 
     def get_current_session_id(self) -> Optional[str]:
@@ -41,6 +78,7 @@ class SessionManager:
 
     def set_current_session_id(self, session_id: str) -> None:
         self._current_session_id = session_id
+        self._provider_sessions["deepseek"] = session_id
         if session_id not in self._last_message_ids:
             self._last_message_ids[session_id] = None
 
@@ -89,6 +127,7 @@ class SessionManager:
             raise ValueError(f"Не удалось создать чат-сессию DeepSeek: {result}")
 
         self._current_session_id = session_id
+        self._provider_sessions["deepseek"] = session_id
         self._last_message_ids[session_id] = None
         logger.info(f"Создана новая сессия DeepSeek: {session_id}")
         return session_id
@@ -102,19 +141,24 @@ class SessionManager:
             if session_id not in self._last_message_ids:
                 self._last_message_ids[session_id] = None
             self._current_session_id = session_id
+            self._provider_sessions["deepseek"] = session_id
             return session_id
 
-        # В режиме единой сессии (single) повторно используем активную сессию, не создавая новые чаты
-        if self.single_session_mode and self._current_session_id:
-            logger.debug(f"Переиспользование текущей сессии DeepSeek (Single-Session): {self._current_session_id}")
-            return self._current_session_id
+        # В режиме единой сессии (single) повторно используем сохранённую сессию DeepSeek
+        if self.single_session_mode:
+            saved = self._provider_sessions.get("deepseek") or self._current_session_id
+            if saved:
+                logger.debug(f"Переиспользование текущей сессии DeepSeek (Single-Session): {saved}")
+                self._current_session_id = saved
+                return saved
 
         # Иначе создаем новую сессию
         return await self.create_new_session(client)
 
     def reset_context(self) -> None:
-        """Сбрасывает текущую активную сессию (для начала чистого диалога)."""
+        """Сбрасывает текущую активную сессию DeepSeek (для начала чистого диалога)."""
         self._current_session_id = None
+        self._provider_sessions.pop("deepseek", None)
 
 
 session_manager = SessionManager()

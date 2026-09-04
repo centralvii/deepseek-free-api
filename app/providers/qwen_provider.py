@@ -101,9 +101,14 @@ class QwenProvider(BaseLLMProvider):
 
     def set_session_id(self, session_id: str) -> None:
         self._current_chat_id = session_id
+        from app.services.session_manager import session_manager
+        if session_manager.single_session_mode:
+            session_manager.set_provider_session("qwen", session_id)
 
     def reset_session(self) -> None:
         self._current_chat_id = None
+        from app.services.session_manager import session_manager
+        session_manager.clear_provider_session("qwen")
 
     async def list_sessions(self) -> List[dict]:
         """Возвращает список существующих чатов с сервера Qwen."""
@@ -252,17 +257,34 @@ class QwenProvider(BaseLLMProvider):
         """
         Получает существующий chat_id, либо использует единый постоянный чат (в режиме single_session_mode),
         либо создает новую сессию через POST /api/v2/chats/new.
+        
+        В single_session_mode сессия хранится в session_manager per-provider, 
+        поэтому при смене провайдеров сессия Qwen восстанавливается.
         """
+        from app.services.session_manager import session_manager
+
         if chat_id:
             self._current_chat_id = chat_id
+            # Сохраняем в per-provider хранилище
+            if session_manager.single_session_mode:
+                session_manager.set_provider_session("qwen", chat_id)
             return chat_id
 
-        from app.services.session_manager import session_manager
-        if session_manager.single_session_mode and self._current_chat_id:
-            logger.debug(f"Переиспользование текущего чата Qwen (Single-Session): {self._current_chat_id}")
-            return self._current_chat_id
+        if session_manager.single_session_mode:
+            # В single-режиме: берём локальный _current_chat_id (если есть),
+            # иначе пробуем восстановить из session_manager (сессия другой вкладки/перезапуска)
+            existing = self._current_chat_id or session_manager.get_provider_session("qwen")
+            if existing:
+                self._current_chat_id = existing
+                # Синхронизируем в session_manager чтобы следующие провайдеры тоже видели
+                session_manager.set_provider_session("qwen", existing)
+                logger.debug(f"Переиспользование текущего чата Qwen (Single-Session): {existing}")
+                return existing
 
-        return await self._create_new_chat()
+        new_id = await self._create_new_chat()
+        if session_manager.single_session_mode and new_id:
+            session_manager.set_provider_session("qwen", new_id)
+        return new_id
 
     def _build_payload(self, prompt: str, model: str, chat_id: str, thinking_enabled: bool, search_enabled: bool) -> dict:
         """Формирует точный JSON payload протокола v2.1 chat.qwen.ai."""
@@ -335,7 +357,8 @@ class QwenProvider(BaseLLMProvider):
 
         chat_id = await self.get_or_create_chat(request.chat_session_id)
         resolved_model = self._resolve_qwen_model(request.model)
-        thinking_enabled = request.thinking_enabled if request.thinking_enabled is not None else True
+        # Default to False (fast mode) when not explicitly set - user controls this via toggle
+        thinking_enabled = request.thinking_enabled if request.thinking_enabled is not None else False
         search_enabled = request.search_enabled if request.search_enabled is not None else False
 
         headers = self._build_headers(token, chat_id, thinking_enabled)
