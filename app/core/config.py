@@ -44,5 +44,15 @@ class Settings(BaseSettings):
     RETAIN_RECENT_MESSAGES_COUNT: int = Field(default=12, description="Количество последних сообщений без сжатия")
     MAX_TOOL_OUTPUT_TOKENS: int = Field(default=25_000, description="Максимальный размер отдельного вывода инструмента")
 
+    # Proxy Session Mode ('single' or 'multi')
+    PROXY_MODE: str = Field(
+        default="single",
+        description="Режим работы сессий: 'single' (единая сессия без создания новых чатов) или 'multi' (новый чат на запрос)"
+    )
+    SINGLE_SESSION_MODE: bool = Field(
+        default=True,
+        description="Работать в рамках одной постоянной сессии, предотвращая частые вызовы chat_session/create и ошибку 429"
+    )
+
 
 settings = Settings()

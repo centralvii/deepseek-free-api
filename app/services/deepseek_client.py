@@ -12,7 +12,7 @@ from app.schemas.chat import (
     ModelInfo,
     StreamChunk,
 )
-from app.services.pow_solver import pow_solver
+from app.core.pow_solver import pow_solver
 from app.services.session_manager import session_manager
 from app.services.sse_parser import parse_sse_lines, parse_sse_stream
 
@@ -197,13 +197,19 @@ class DeepSeekClient:
 
             if resp.status_code != 200:
                 body = await resp.aread()
-                logger.error(f"DeepSeek returned status {resp.status_code}: {body.decode('utf-8', errors='replace')}")
+                err_text = body.decode("utf-8", errors="replace")
+                logger.error(f"DeepSeek returned status {resp.status_code}: {err_text}")
+                if resp.status_code in [400, 404] or "session" in err_text.lower():
+                    session_manager.invalidate_current_session()
                 raise HTTPException(
                     status_code=resp.status_code,
-                    detail=f"DeepSeek API error ({resp.status_code}): {body.decode('utf-8', errors='replace')}"
+                    detail=f"DeepSeek API error ({resp.status_code}): {err_text}"
                 )
 
             async for chunk in parse_sse_lines(resp.aiter_lines(), session_id=session_id):
+                if chunk.type == "error":
+                    if "session" in chunk.text.lower() or "not found" in chunk.text.lower():
+                        session_manager.invalidate_current_session()
                 if chunk.message_id is not None:
                     last_message_id = chunk.message_id
                 if chunk.type == "title" and chunk.text:
@@ -220,7 +226,7 @@ class DeepSeekClient:
         full_content = []
         message_id = 0
         token_usage = None
-        session_id = request.chat_session_id or ""
+        error_msg = None
 
         async for chunk in self.stream_chat(request):
             if chunk.session_id:
@@ -230,10 +236,18 @@ class DeepSeekClient:
             if chunk.token_usage:
                 token_usage = chunk.token_usage
 
-            if chunk.type == "thinking":
+            if chunk.type == "error":
+                error_msg = chunk.text
+            elif chunk.type == "thinking":
                 full_thinking.append(chunk.text)
             elif chunk.type == "content":
                 full_content.append(chunk.text)
+
+        if not full_content and error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS if ("частые" in error_msg.lower() or "too frequent" in error_msg.lower()) else status.HTTP_502_BAD_GATEWAY,
+                detail=error_msg
+            )
 
         return DeepSeekChatResponse(
             session_id=session_id,

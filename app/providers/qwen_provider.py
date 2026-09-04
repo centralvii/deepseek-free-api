@@ -244,14 +244,17 @@ class QwenProvider(BaseLLMProvider):
 
     async def get_or_create_chat(self, chat_id: Optional[str] = None) -> str:
         """
-        Получает существующий chat_id или создает новую сессию через POST /api/v2/chats/new.
-        Если chat_id не указан (stateless запросы от внешних агентов ZCode/Cline),
-        всегда создается чистая новая сессия, предотвращающая переполнение контекста
-        и ошибку internal_error на серверах Alibaba.
+        Получает существующий chat_id, либо использует единый постоянный чат (в режиме single_session_mode),
+        либо создает новую сессию через POST /api/v2/chats/new.
         """
         if chat_id:
             self._current_chat_id = chat_id
             return chat_id
+
+        from app.services.session_manager import session_manager
+        if session_manager.single_session_mode and self._current_chat_id:
+            logger.debug(f"Переиспользование текущего чата Qwen (Single-Session): {self._current_chat_id}")
+            return self._current_chat_id
 
         return await self._create_new_chat()
 

@@ -39,7 +39,7 @@ class MultiProviderCommandCompleter(Completer):
     """Динамическое автодополнение команд и моделей для всех провайдеров."""
 
     COMMANDS = {
-        "/proxy": "Режим Proxy-монитора (прослушка и логирование запросов от Cline / Roo / Cursor)",
+        "/proxy": "Режим Proxy (single - единая сессия, multi - изолированные чаты)",
         "/login": "Войти через окно браузера и автоматически получить токен",
         "/provider": "Переключить активного провайдера (deepseek, qwen)",
         "/model": "Переключить модель LLM",
@@ -58,8 +58,10 @@ class MultiProviderCommandCompleter(Completer):
 
     SUBCOMMANDS = {
         "/proxy": {
-            "start": "Запустить прокси-сервер и режим мониторинга агентов",
-            "status": "Показать статус и эндпоинты для подключения Cline / Cursor",
+            "single": "Единая сессия (без создания новых чатов — защита от 429/падений)",
+            "multi": "Изолированные чаты (новый чат на каждый запрос — для Cline/Cursor)",
+            "start": "Запустить прокси-сервер в интерактивном режиме выбора",
+            "status": "Показать статус и эндпоинты для подключения",
         },
         "/login": {
             "deepseek": "Открыть браузер и войти в DeepSeek",
@@ -220,7 +222,7 @@ class MultiProviderCLI:
     def print_help(self):
         help_text = """
 [bold cyan]Команды управления (поддерживается автодополнение по Tab):[/bold cyan]
-  [bold yellow]/proxy[/bold yellow]                       - Перейти в режим Proxy-монитора (прослушка запросов от Cline/Roo)
+  [bold yellow]/proxy [single|multi][/bold yellow]        - Запустить Proxy (single: единая сессия, multi: новый чат на запрос)
   [bold yellow]/login [deepseek|qwen][/bold yellow]    - Автоматический вход через окно браузера (без ручного копирования)
   [bold yellow]/provider <deepseek|qwen>[/bold yellow] - Переключить активного провайдера
   [bold yellow]/model <name>[/bold yellow]              - Переключить модель (v4-pro, qwen3.7-plus, qwen-3.8-coder и др.)
@@ -256,23 +258,52 @@ class MultiProviderCLI:
         self._server_task = asyncio.create_task(server.serve())
         await asyncio.sleep(0.6)
 
-    async def enter_proxy_mode(self):
-        """Запускает интерактивный инспектор запросов от внешних AI-агентов (Cline, Cursor, Roo)."""
-        console.print(f"[cyan]Инициализация Proxy-сервера на порту {settings.PORT}...[/cyan]")
+    async def enter_proxy_mode(self, mode: Optional[str] = None):
+        """Запускает интерактивный инспектор запросов от внешних AI-агентов (Stepik Autopilot, Cline, Cursor, Roo)."""
+        if mode:
+            is_single = mode.lower().strip() in ["single", "1", "s", "true"]
+            session_manager.set_single_session_mode(is_single)
+        else:
+            if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+                console.print("\n[bold cyan]Выберите режим работы Proxy-сервера:[/bold cyan]")
+                console.print("  [bold yellow][1][/bold yellow] [bold]Изолированные чаты[/bold] (Multi-Session: новый чат на каждый запрос — для Cline/Cursor)")
+                console.print("  [bold green][2][/bold green] [bold]Единая сессия[/bold]      (Single-Session: без создания новых чатов — защита от 429/падений) [dim][По умолчанию][/dim]")
+                try:
+                    if self.session:
+                        choice = (await self.session.prompt_async([("class:prompt", "Ваш выбор [1/2] (по умолчанию: 2): ")])).strip()
+                    else:
+                        choice = input("Ваш выбор [1/2] (по умолчанию: 2): ").strip()
+                except Exception:
+                    choice = "2"
+                is_single = (choice != "1")
+            else:
+                is_single = bool(settings.SINGLE_SESSION_MODE or settings.PROXY_MODE.lower() == "single")
+            session_manager.set_single_session_mode(is_single)
+
+        mode_desc = "Единая сессия (Single-Session)" if session_manager.is_single_session_mode() else "Изолированные чаты (Multi-Session)"
+        console.print(f"[cyan]Инициализация Proxy-сервера на порту {settings.PORT} [Режим: {mode_desc}]...[/cyan]")
         await self.start_background_server()
+
+        is_single = session_manager.is_single_session_mode()
+        mode_badge = (
+            "[bold green]Единая сессия (Single-Session: один чат без создания новых)[/bold green]"
+            if is_single
+            else "[bold yellow]Изолированные чаты (Multi-Session: новый чат на запрос)[/bold yellow]"
+        )
 
         proxy_banner = f"""
 [bold cyan]╔════════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                   🛡️ РЕЖИМ PROXY: МОНИТОРИНГ И ЛОГИРОВАНИЕ ЗАПРОСОВ АГЕНТОВ                     ║
 ║                                                                                                ║
+║  • Режим сессий:       {mode_badge}
 ║  • OpenAI Endpoint:    [bold yellow]http://127.0.0.1:{settings.PORT}/v1/chat/completions[/bold yellow]                               ║
 ║  • Anthropic Endpoint: [bold yellow]http://127.0.0.1:{settings.PORT}/v1/messages[/bold yellow]                                      ║
 ║  • API Key:            [bold green]любая строка (например, 'deepseek' или 'qwen')[/bold green]                        ║
 ║                                                                                                ║
-║  [bold]Настройки подключения для Cline / Roo Code / Cursor:[/bold]                                      ║
+║  [bold]Настройки подключения для Stepik Autopilot / Cline / Roo Code / Cursor:[/bold]                         ║
 ║    API Provider: [yellow]OpenAI Compatible[/yellow] или [yellow]Anthropic[/yellow]                                         ║
 ║    Base URL:     [yellow]http://127.0.0.1:{settings.PORT}/v1[/yellow]                                                    ║
-║    Model ID:     [yellow]deepseek-v4-pro[/yellow] | [yellow]deepseek-reasoner[/yellow] | [yellow]qwen-3.8-coder[/yellow]                          ║
+║    Model ID:     [yellow]deepseek-v4-pro[/yellow] | [yellow]deepseek-reasoner[/yellow] | [yellow]qwen3.7-plus[/yellow]                            ║
 ╚════════════════════════════════════════════════════════════════════════════════════════════════╝[/bold cyan]
 [bold green]● Proxy-сервер активен и слушает входящие запросы.[/bold green]
 [dim]Для возврата в режим интерактивного диалога нажмите [bold]Ctrl+C[/bold].[/dim]
@@ -297,10 +328,11 @@ class MultiProviderCLI:
                 tools = event.get("tools", [])
                 t_str = f" | Tools ({len(tools)}): {', '.join(tools[:5])}{'...' if len(tools)>5 else ''}" if tools else " | Tools: нет"
                 t_now = event.get("time", "")
+                sess_info = "Single-Session (без создания новых чатов)" if session_manager.is_single_session_mode() else "Multi-Session (новый чат)"
 
                 console.print(f"\n[bold magenta]┌── 📥 [{t_now}] Входящий запрос от агента ({event.get('user_agent', 'Agent')}) ──────────────────────[/bold magenta]")
                 console.print(f"[bold magenta]│[/bold magenta] [bold cyan]Протокол:[/bold cyan] {proto} ({ep}) | [bold cyan]Модель:[/bold cyan] [yellow]{m}[/yellow] -> [green]{p}[/green]")
-                console.print(f"[bold magenta]│[/bold magenta] [dim]Контекст: {msgs} сообщений (~{toks:,} токенов){t_str}[/dim]")
+                console.print(f"[bold magenta]│[/bold magenta] [dim]Сессия: {sess_info} | Контекст: {msgs} сообщений (~{toks:,} токенов){t_str}[/dim]")
                 console.print(f"[bold magenta]└── Потоковая генерация ответа ───────────────────────────────────────────────────────────[/bold magenta]")
 
             elif e_type == "thinking_chunk":
@@ -438,12 +470,12 @@ class MultiProviderCLI:
         except Exception as e:
             console.print(f"\n[bold red]Ошибка выполнения запроса:[/bold red] {e}\n")
 
-    async def run(self, auto_proxy: bool = False):
+    async def run(self, auto_proxy: bool = False, proxy_mode: Optional[str] = None):
         await self.init()
         self.print_banner()
 
         if auto_proxy:
-            await self.enter_proxy_mode()
+            await self.enter_proxy_mode(mode=proxy_mode)
 
         while True:
             try:
@@ -471,7 +503,8 @@ class MultiProviderCLI:
                         os.system("cls" if os.name == "nt" else "clear")
                         self.print_banner()
                     elif cmd in ["/proxy", "/server"]:
-                        await self.enter_proxy_mode()
+                        proxy_arg = arg.lower().strip() if arg else None
+                        await self.enter_proxy_mode(mode=proxy_arg)
                     elif cmd == "/login":
                         target_p = arg.lower().strip() if arg else self.provider_id
                         if target_p not in ["deepseek", "qwen"]:
@@ -604,7 +637,25 @@ def main():
     parser.add_argument(
         "--proxy", "-p",
         action="store_true",
-        help="Сразу запустить режим Proxy-монитора (для ZCode, Cline, Cursor, Roo Code)",
+        help="Сразу запустить режим Proxy-сервера (для Stepik Autopilot, Cline, Cursor, Roo Code)",
+    )
+    parser.add_argument(
+        "--mode", "--proxy-mode",
+        dest="proxy_mode",
+        type=str,
+        default=None,
+        choices=["single", "multi"],
+        help="Режим сессий прокси: 'single' (единая сессия без создания новых чатов) или 'multi' (новый чат на запрос)",
+    )
+    parser.add_argument(
+        "--single", "-s",
+        action="store_true",
+        help="Запустить прокси в режиме единой сессии (Single-Session: без создания новых чатов, защита от 429)",
+    )
+    parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="Запустить прокси в режиме изолированных чатов (Multi-Session: новый чат на каждый запрос)",
     )
     parser.add_argument(
         "--provider",
@@ -617,20 +668,39 @@ def main():
         "--model", "-m",
         type=str,
         default=None,
-        help="Выбрать модель по умолчанию (например, deepseek-v4-pro, qwen-3.8-coder)",
+        help="Выбрать модель по умолчанию (например, deepseek-v4-pro, qwen3.7-plus)",
     )
     parser.add_argument(
         "command",
-        nargs="?",
-        default=None,
-        help="Команда быстрого запуска (например, 'proxy' или 'server')",
+        nargs="*",
+        default=[],
+        help="Команда быстрого запуска (например, 'proxy single' или 'proxy multi')",
     )
 
     args = parser.parse_args()
 
     cli = MultiProviderCLI()
 
-    auto_proxy = args.proxy or (bool(args.command) and args.command.lower() in ["proxy", "server", "/proxy", "/server"])
+    raw_cmds = args.command if isinstance(args.command, list) else [args.command]
+    commands = [str(c).lower().strip() for c in raw_cmds if c]
+
+    auto_proxy = args.proxy or any(c in ["proxy", "server", "/proxy", "/server"] for c in commands)
+
+    proxy_mode = None
+    if args.single:
+        proxy_mode = "single"
+    elif args.multi:
+        proxy_mode = "multi"
+    elif args.proxy_mode:
+        proxy_mode = args.proxy_mode.lower()
+    else:
+        for c in commands:
+            if c in ["single", "1", "s"]:
+                proxy_mode = "single"
+                break
+            elif c in ["multi", "2", "m"]:
+                proxy_mode = "multi"
+                break
 
     if args.provider:
         cli.set_provider_and_default_model(args.provider)
@@ -639,7 +709,7 @@ def main():
         cli.provider_id = target_provider.provider_id
         cli.model = args.model
 
-    asyncio.run(cli.run(auto_proxy=auto_proxy))
+    asyncio.run(cli.run(auto_proxy=auto_proxy, proxy_mode=proxy_mode))
 
 
 if __name__ == "__main__":

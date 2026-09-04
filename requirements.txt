@@ -8,3 +8,4 @@ rich>=13.7.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 prompt_toolkit>=3.0.40
+playwright>=1.40.0

@@ -16,6 +16,25 @@ class SessionManager:
         self._last_message_ids: Dict[str, Optional[int]] = {}
         # Заголовки чатов
         self._session_titles: Dict[str, str] = {}
+        # Режим единой сессии (single) vs изолированные чаты (multi)
+        self.single_session_mode: bool = bool(
+            settings.SINGLE_SESSION_MODE or (settings.PROXY_MODE.lower() == "single")
+        )
+
+    def set_single_session_mode(self, enabled: bool) -> None:
+        """Включает или выключает режим единой сессии (без создания новых чатов)."""
+        self.single_session_mode = enabled
+        logger.info(f"Режим сессий переключен: {'Единая сессия (Single)' if enabled else 'Изолированные чаты (Multi)'}")
+
+    def is_single_session_mode(self) -> bool:
+        return self.single_session_mode
+
+    def invalidate_current_session(self) -> None:
+        """Инвалидирует текущую сессию при ошибке или устаревании на сервере."""
+        if self._current_session_id:
+            logger.warning(f"Инвалидация сессии DeepSeek: {self._current_session_id}")
+            self._last_message_ids.pop(self._current_session_id, None)
+            self._current_session_id = None
 
     def get_current_session_id(self) -> Optional[str]:
         return self._current_session_id
@@ -76,16 +95,21 @@ class SessionManager:
 
     async def get_or_create_session(self, client: httpx.AsyncClient, session_id: Optional[str] = None) -> str:
         """
-        Возвращает указанный session_id или создает новую чистую сессию для stateless запросов.
-        Если session_id не указан (stateless запросы от внешних агентов ZCode/Cline/Cursor),
-        всегда создается чистая новая сессия, чтобы полный контекст диалога (messages),
-        который агент передает в каждом запросе, не накапливался квадратично на сервере DeepSeek.
+        Возвращает указанный session_id, либо использует текущую единую сессию (в режиме single_session_mode),
+        либо создает новую чистую сессию (в режиме multi_session_mode).
         """
         if session_id:
             if session_id not in self._last_message_ids:
                 self._last_message_ids[session_id] = None
+            self._current_session_id = session_id
             return session_id
 
+        # В режиме единой сессии (single) повторно используем активную сессию, не создавая новые чаты
+        if self.single_session_mode and self._current_session_id:
+            logger.debug(f"Переиспользование текущей сессии DeepSeek (Single-Session): {self._current_session_id}")
+            return self._current_session_id
+
+        # Иначе создаем новую сессию
         return await self.create_new_session(client)
 
     def reset_context(self) -> None:

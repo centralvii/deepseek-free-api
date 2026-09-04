@@ -11,6 +11,7 @@ from app.core.credentials import credentials_manager
 logger = logging.getLogger(__name__)
 
 WASM_WORKER_PATH = Path(__file__).parent.parent / "wasm" / "pow_worker.cjs"
+DEEPSEEK_WASM_FALLBACK_URL = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
 
 
 class PoWSolver:
@@ -18,6 +19,20 @@ class PoWSolver:
         self.worker_path = worker_path
         if not self.worker_path.exists():
             raise FileNotFoundError(f"WASM воркер не найден по пути {self.worker_path}")
+        self._ensure_wasm_file()
+
+    def _ensure_wasm_file(self):
+        wasm_file = self.worker_path.parent / "sha3_wasm_bg.wasm"
+        if not wasm_file.exists():
+            try:
+                logger.info("Загрузка sha3_wasm_bg.wasm...")
+                with httpx.Client(timeout=15.0) as client:
+                    resp = client.get(DEEPSEEK_WASM_FALLBACK_URL)
+                    if resp.status_code == 200 and resp.content[:4] == b"\x00asm":
+                        wasm_file.write_bytes(resp.content)
+                        logger.info("sha3_wasm_bg.wasm успешно загружен.")
+            except Exception as e:
+                logger.warning(f"Не удалось автоматически загрузить sha3_wasm_bg.wasm: {e}")
 
     async def get_challenge(self, client: httpx.AsyncClient, target_path: str = "/api/v0/chat/completion") -> Dict[str, Any]:
         url = f"{settings.DEEPSEEK_BASE_URL}/api/v0/chat/create_pow_challenge"
